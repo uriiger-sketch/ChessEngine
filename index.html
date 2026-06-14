@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+  <!-- iOS PWA -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="ChessNN">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+
+  <!-- PWA manifest -->
+  <link rel="manifest" href="manifest.json">
+
+  <title>ChessNN</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- Chess board -->
+  <div id="board-wrap">
+    <div id="board"></div>
+    <!-- AI thinking spinner (shown during engine search) -->
+    <div id="thinking-overlay" hidden>
+      <div class="spinner"></div>
+    </div>
+  </div>
+
+  <!-- Controls below the board -->
+  <div id="controls">
+    <div id="status">Loading…</div>
+
+    <div id="captured-wrap"></div>
+
+    <!-- Think time selector -->
+    <div class="btn-row">
+      <button class="ctrl-btn" data-time="2000">2s</button>
+      <button class="ctrl-btn active" data-time="5000">5s</button>
+      <button class="ctrl-btn" data-time="10000">10s</button>
+    </div>
+
+    <div class="btn-row">
+      <button class="ctrl-btn" id="new-game-btn">New Game</button>
+    </div>
+
+    <label id="nn-toggle">
+      <input type="checkbox" id="nn-cb" checked>
+      Neural Net evaluation
+    </label>
+  </div>
+
+  <!-- Pawn promotion modal -->
+  <div id="promo-modal" hidden>
+    <div id="promo-choices"></div>
+  </div>
+
+  <!-- UI module (loads chess.js, engine.js, neural.js via imports) -->
+  <script type="module" src="js/ui.js"></script>
+
+  <!-- Service worker registration -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
