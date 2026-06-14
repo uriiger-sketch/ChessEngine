@@ -1,16 +1,15 @@
 'use strict';
-// ChessNN Training Script
-// Reads all PGN files in the parent directory, extracts board positions,
-// trains a neural network, and exports the model to ../model/
+// ChessNN Training Script — improved with game-result labels
+// Labels blend material balance (early game) with actual game outcome (late game),
+// giving the NN genuine positional understanding beyond piece counting.
 //
-// Usage:
-//   cd train && npm install && node train.js
+// Usage: cd train && npm install && node train.js
 
 const tf   = require('@tensorflow/tfjs-node');
 const fs   = require('fs');
 const path = require('path');
 
-const PGN_DIR  = path.join(__dirname, '..');
+const PGN_DIR   = path.join(__dirname, '..');
 const MODEL_DIR = path.join(__dirname, '..', 'model');
 const PGN_FILES = [
   '1Carlsen.pgn', '2Caruana.pgn', '3Fischer.pgn',
@@ -18,14 +17,14 @@ const PGN_FILES = [
 ];
 
 const BATCH_SIZE    = 5000;
-const BATCH_EPOCHS  = 3;
+const BATCH_EPOCHS  = 5;   // more epochs per batch for deeper learning
 const LEARNING_RATE = 0.001;
-// Material score range for normalization (pawn=1,N/B=3,R=5,Q=9 × counts)
-const Y_MAX = 39;
+const Y_MAX = 39;          // label clamp in pawn-units
 const Y_MIN = -39;
+const SAMPLE_RATE   = 0.5; // sample 50% of positions (was 25%)
+const SKIP_PLY      = 10;  // ignore first 10 half-moves (too similar across games)
 
 // ── Chess Board Logic ──────────────────────────────────────────────────────
-// (Self-contained; does not import from ../js/chess.js)
 
 const SIMPLE_VALS = [0, 1, 3, 3, 5, 9, 0];
 
@@ -41,10 +40,8 @@ function initState() {
       [ 1, 1, 1, 1, 1, 1, 1, 1],
       [ 4, 2, 3, 5, 6, 3, 2, 4]
     ],
-    wKc: true, wQc: true,
-    bKc: true, bQc: true,
-    enPassantTarget: null,
-    lastMove: null
+    wKc: true, wQc: true, bKc: true, bQc: true,
+    enPassantTarget: null, lastMove: null
   };
 }
 
@@ -61,7 +58,7 @@ function inBounds(r, c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
 
 function squareAttacked(board, r, c, attackerSide) {
   const aSign = attackerSide === 'white' ? 1 : -1;
-  const pr = r + aSign; // pawn attacks from this row
+  const pr = r + aSign;
   if (inBounds(pr, c-1) && board[pr][c-1] === aSign) return true;
   if (inBounds(pr, c+1) && board[pr][c+1] === aSign) return true;
   for (const [dr,dc] of [[1,2],[1,-2],[-1,2],[-1,-2],[2,1],[2,-1],[-2,1],[-2,-1]]) {
@@ -208,11 +205,20 @@ function getLegalMoves(st, side) {
 // ── PGN Parsing ────────────────────────────────────────────────────────────
 
 function splitGames(text) {
-  // Normalize Windows \r\n to \n before splitting
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   return normalized.split(/\n\n+(?=\[)/g)
     .map(g => g.trim())
     .filter(g => g.length > 0 && g.includes('.'));
+}
+
+// Extract game result from PGN headers: returns +1 (white), -1 (black), 0 (draw), null (unknown)
+function parseResult(gameText) {
+  const m = gameText.match(/\[Result\s+"([^"]+)"\]/);
+  if (!m) return null;
+  if (m[1] === '1-0')         return  1;
+  if (m[1] === '0-1')         return -1;
+  if (m[1].includes('1/2'))   return  0;
+  return null;
 }
 
 function sanToMove(san, state, side) {
@@ -221,13 +227,11 @@ function sanToMove(san, state, side) {
 
   if (clean === 'O-O' || clean === '0-0') {
     const r = side === 'white' ? 7 : 0;
-    const p = state.board[r][4];
-    return {from:[r,4],to:[r,6],piece:p,captured:0,castle:'K'};
+    return {from:[r,4],to:[r,6],piece:state.board[r][4],captured:0,castle:'K'};
   }
   if (clean === 'O-O-O' || clean === '0-0-0') {
     const r = side === 'white' ? 7 : 0;
-    const p = state.board[r][4];
-    return {from:[r,4],to:[r,2],piece:p,captured:0,castle:'Q'};
+    return {from:[r,4],to:[r,2],piece:state.board[r][4],captured:0,castle:'Q'};
   }
 
   let s = clean;
@@ -240,10 +244,9 @@ function sanToMove(san, state, side) {
   s = s.replace('x','');
 
   if (s.length < 2) return null;
-  const destFile = s[s.length-2], destRank = s[s.length-1];
-  if (destFile < 'a' || destFile > 'h') return null;
-  const tc = destFile.charCodeAt(0) - 97;
-  const tr = 8 - parseInt(destRank, 10);
+  const tc = s[s.length-2].charCodeAt(0) - 97;
+  const tr = 8 - parseInt(s[s.length-1], 10);
+  if (tc < 0 || tc > 7 || tr < 0 || tr > 7) return null;
   s = s.slice(0, -2);
 
   let disFile = -1, disRank = -1;
@@ -253,9 +256,7 @@ function sanToMove(san, state, side) {
   }
 
   const fs = side === 'white' ? 1 : -1;
-  const allMoves = getLegalMoves(state, side);
-
-  for (const mv of allMoves) {
+  for (const mv of getLegalMoves(state, side)) {
     const [fr, fc] = mv.from;
     if (Math.abs(mv.piece) !== pieceType) continue;
     if (mv.to[0] !== tr || mv.to[1] !== tc) continue;
@@ -272,6 +273,7 @@ function sanToMove(san, state, side) {
   return null;
 }
 
+// Material balance from White's perspective in pawn units
 function simpleEval(board) {
   let score = 0;
   for (let r = 0; r < 8; r++)
@@ -301,25 +303,28 @@ function boardToVector(board) {
 
 function createModel() {
   const m = tf.sequential();
-  m.add(tf.layers.dense({ units: 256, activation: 'tanh', inputShape: [768] }));
-  m.add(tf.layers.dense({ units: 128, activation: 'tanh' }));
-  m.add(tf.layers.dense({ units:  64, activation: 'tanh' }));
-  m.add(tf.layers.dense({ units:  32, activation: 'tanh' }));
+  m.add(tf.layers.dense({ units: 256, activation: 'relu', inputShape: [768] }));
+  m.add(tf.layers.dense({ units: 128, activation: 'relu' }));
+  m.add(tf.layers.dense({ units:  64, activation: 'relu' }));
+  m.add(tf.layers.dense({ units:  32, activation: 'relu' }));
   m.add(tf.layers.dense({ units:   1, activation: 'linear' }));
-  m.compile({ optimizer: tf.train.adam(LEARNING_RATE), loss: 'meanSquaredError' });
+  m.compile({
+    optimizer: tf.train.adam(LEARNING_RATE),
+    loss: 'meanSquaredError'
+  });
   return m;
 }
 
 // ── Training Loop ──────────────────────────────────────────────────────────
 
 async function trainBatch(model, xArr, yArr) {
-  // Normalize: binary input [0,1] → [-1,+1]; scores → [-1,+1]
+  // Inputs: [0,1] → [-1,+1]; labels: pawn-units → [-1,+1]
   const xNorm = xArr.map(v => v * 2 - 1);
-  const yNorm = yArr.map(v => v / Y_MAX); // clamp to approx [-1,+1]
+  const yNorm = yArr.map(v => v / Y_MAX);
 
   const xs = tf.tensor2d(xNorm, [yArr.length, 768]);
   const ys = tf.tensor2d(yNorm, [yArr.length, 1]);
-  const h = await model.fit(xs, ys, {
+  const h  = await model.fit(xs, ys, {
     epochs: BATCH_EPOCHS,
     batchSize: 256,
     shuffle: true,
@@ -330,9 +335,10 @@ async function trainBatch(model, xArr, yArr) {
 }
 
 async function main() {
-  console.log('ChessNN Training Script');
-  console.log('=======================');
+  console.log('ChessNN Training Script (with game-result labels)');
+  console.log('==================================================');
   console.log(`Batch size: ${BATCH_SIZE}, Epochs/batch: ${BATCH_EPOCHS}`);
+  console.log(`Sample rate: ${SAMPLE_RATE * 100}%, Skip first ${SKIP_PLY} ply`);
   console.log(`PGN files: ${PGN_FILES.join(', ')}\n`);
 
   if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
@@ -347,6 +353,7 @@ async function main() {
   let totalGames = 0;
   let batchCount = 0;
   let lastLoss = null;
+  let wonGames = 0, lostGames = 0, drawnGames = 0;
 
   async function flushBatch() {
     if (nInBatch === 0) return;
@@ -355,7 +362,7 @@ async function main() {
     const ySlice = Array.from(yBuf.slice(0, nInBatch));
     lastLoss = await trainBatch(model, xSlice, ySlice);
     nInBatch = 0;
-    console.log(`  Batch ${batchCount}: loss=${lastLoss.toFixed(4)}, positions so far: ${totalPositions.toLocaleString()}`);
+    console.log(`  Batch ${batchCount}: loss=${lastLoss.toFixed(4)}, total=${totalPositions.toLocaleString()}`);
   }
 
   for (const file of PGN_FILES) {
@@ -368,11 +375,17 @@ async function main() {
     console.log(`  Found ${games.length} games`);
 
     let filePositions = 0;
-    for (const gameText of games) {
-      let state = initState();
-      let side = 'white';
 
-      // Strip headers and comments
+    for (const gameText of games) {
+      // ── Parse game result for label blending ────────────────────────────
+      const result = parseResult(gameText); // +1, -1, 0, or null
+      if (result === 1) wonGames++;
+      else if (result === -1) lostGames++;
+      else if (result === 0) drawnGames++;
+
+      const resultScore = result !== null ? result * Y_MAX : null;
+
+      // ── Strip PGN headers and comments ──────────────────────────────────
       const moveText = gameText
         .replace(/\[[^\]]*\]/g, '')
         .replace(/\{[^}]*\}/g, '')
@@ -384,50 +397,69 @@ async function main() {
       const tokens = moveText.split(/\s+/)
         .filter(t => t && !/^(1-0|0-1|1\/2-1\/2|\*)$/.test(t));
 
-      let ok = true;
+      let state = initState();
+      let side  = 'white';
+      let ok    = true;
+      let ply   = 0;
+
       for (const token of tokens) {
         if (!ok) break;
         const san = token.replace(/[+#!?]+$/g, '');
         if (!san) continue;
+
         const mv = sanToMove(san, state, side);
         if (!mv) { ok = false; break; }
         state = makeMove(state, mv);
-
-        if (Math.random() < 0.25) {
-          const vec = boardToVector(state.board);
-          const score = simpleEval(state.board);
-          xBuf.set(vec, nInBatch * 768);
-          yBuf[nInBatch] = Math.max(Y_MIN, Math.min(Y_MAX, score));
-          nInBatch++;
-          totalPositions++;
-          filePositions++;
-          if (nInBatch === BATCH_SIZE) await flushBatch();
-        }
+        ply++;
         side = side === 'white' ? 'black' : 'white';
+
+        // Skip first SKIP_PLY half-moves (opening book positions all look the same)
+        if (ply <= SKIP_PLY) continue;
+
+        if (Math.random() >= SAMPLE_RATE) continue;
+
+        const matScore = simpleEval(state.board); // White-perspective, pawn units
+
+        let label;
+        if (resultScore !== null) {
+          // Blend: ramp result weight from 20% at ply 10 → 80% at ply 80+
+          const resultWeight = Math.min(0.8, (ply - SKIP_PLY) / 70 * 0.8 + 0.2);
+          label = resultWeight * resultScore + (1 - resultWeight) * matScore;
+        } else {
+          label = matScore;
+        }
+        label = Math.max(Y_MIN, Math.min(Y_MAX, label));
+
+        const vec = boardToVector(state.board);
+        xBuf.set(vec, nInBatch * 768);
+        yBuf[nInBatch] = label;
+        nInBatch++;
+        totalPositions++;
+        filePositions++;
+
+        if (nInBatch === BATCH_SIZE) await flushBatch();
       }
       totalGames++;
     }
     console.log(`  Collected ${filePositions.toLocaleString()} positions from this file`);
   }
 
-  await flushBatch(); // final partial batch
+  await flushBatch();
 
   console.log(`\nTraining complete!`);
-  console.log(`  Total games processed: ${totalGames.toLocaleString()}`);
-  console.log(`  Total positions:       ${totalPositions.toLocaleString()}`);
-  console.log(`  Total batches:         ${batchCount}`);
-  if (lastLoss !== null) console.log(`  Final loss:            ${lastLoss.toFixed(4)}`);
+  console.log(`  Games: ${totalGames.toLocaleString()} (W:${wonGames} D:${drawnGames} B:${lostGames})`);
+  console.log(`  Total positions: ${totalPositions.toLocaleString()}`);
+  console.log(`  Total batches:   ${batchCount}`);
+  if (lastLoss !== null) console.log(`  Final loss:      ${lastLoss.toFixed(4)}`);
 
-  // Save model
   console.log(`\nSaving model to ${MODEL_DIR}...`);
   await model.save(`file://${MODEL_DIR}`);
 
-  // Save normalization params for inference
   const normParams = { xMin: 0, xMax: 1, yMin: Y_MIN, yMax: Y_MAX };
   fs.writeFileSync(path.join(MODEL_DIR, 'normalization.json'), JSON.stringify(normParams, null, 2));
 
   console.log('Done! Model saved.');
-  console.log('Run a local HTTP server in the project root to play:');
+  console.log('Serve the project root with any HTTP server to play:');
   console.log('  cd .. && python3 -m http.server 8080');
 }
 

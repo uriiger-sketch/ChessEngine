@@ -156,6 +156,40 @@ body {
 #status.draw    { color: #aaa; }
 #status.thinking{ color: #80c6e5; }
 
+/* ── Evaluation Bar ── */
+#eval-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+}
+
+#eval-bar {
+  flex: 1;
+  height: 14px;
+  background: #111;
+  border-radius: 7px;
+  overflow: hidden;
+  border: 1px solid #3a3a3a;
+}
+
+#eval-white-fill {
+  height: 100%;
+  background: linear-gradient(to right, #e8d9b0, #fff5e0);
+  width: 50%;
+  border-radius: 6px 0 0 6px;
+  transition: width 0.35s cubic-bezier(.4, 0, .2, 1);
+}
+
+#eval-text {
+  font-size: 11px;
+  font-weight: 700;
+  color: #bbb;
+  min-width: 36px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 #captured-wrap {
   display: flex;
   gap: 6px;
