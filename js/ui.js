@@ -315,7 +315,26 @@ function showPromoDialog(candidates, callback) {
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────
-newGameBtn.addEventListener('click', startNewGame);
+const playWhiteBtn = document.getElementById('play-white-btn');
+const playBlackBtn = document.getElementById('play-black-btn');
+
+function selectColor(side) {
+  if (side === 'white') {
+    playWhiteBtn.classList.add('active');
+    playBlackBtn.classList.remove('active');
+  } else {
+    playBlackBtn.classList.add('active');
+    playWhiteBtn.classList.remove('active');
+  }
+  startNewGame(side);
+}
+
+playWhiteBtn.addEventListener('click', () => selectColor('white'));
+playBlackBtn.addEventListener('click', () => selectColor('black'));
+playWhiteBtn.addEventListener('touchstart', (e) => { e.preventDefault(); selectColor('white'); }, { passive: false });
+playBlackBtn.addEventListener('touchstart', (e) => { e.preventDefault(); selectColor('black'); }, { passive: false });
+
+newGameBtn.addEventListener('click', () => startNewGame(humanSide));
 newGameBtn.addEventListener('touchstart', (e) => { e.preventDefault(); newGameBtn.click(); }, { passive: false });
 
 nnCb.addEventListener('change', () => { useNN = nnCb.checked; });
@@ -330,13 +349,13 @@ document.querySelectorAll('[data-time]').forEach(btn => {
 });
 
 // ── Initialization ─────────────────────────────────────────────────────────
-function startNewGame() {
+function startNewGame(chosenHumanSide = humanSide) {
   if (aiThinking) return; // don't reset mid-search
+  humanSide = chosenHumanSide;
+  aiSide = opposite(chosenHumanSide);
   gameState = initState();
   gameState._sideToMove = 'white';
   sideToMove = 'white';
-  humanSide = 'white';
-  aiSide = 'black';
   gameOver = false;
   selectedSq = null;
   selectedLegal = [];
@@ -344,6 +363,8 @@ function startNewGame() {
   renderBoard();
   renderCaptured();
   setStatus('White to move');
+  // If the AI plays white, fire its opening move immediately
+  if (aiSide === 'white') requestAIMove();
 }
 
 buildBoard();
