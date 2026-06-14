@@ -81,14 +81,14 @@ body {
 
 /* Both sides render the same outline glyph shapes — only color differs */
 .sq .piece-w {
-  color: #f5f0dc;                       /* warm ivory fill  */
-  -webkit-text-stroke: 1.5px #1a1a1a;  /* crisp dark outline */
-  text-shadow: 0 2px 5px rgba(0,0,0,0.55), 0 1px 2px rgba(0,0,0,0.4);
-}
-.sq .piece-b {
   color: #1a1a1a;                         /* near-black fill   */
   -webkit-text-stroke: 1.5px #f0e8d0;    /* light outline     */
   text-shadow: 0 2px 4px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.25);
+}
+.sq .piece-b {
+  color: #f5f0dc;                       /* warm ivory fill  */
+  -webkit-text-stroke: 1.5px #1a1a1a;  /* crisp dark outline */
+  text-shadow: 0 2px 5px rgba(0,0,0,0.55), 0 1px 2px rgba(0,0,0,0.4);
 }
 
 .sq.selected { background: var(--sq-sel) !important; }
