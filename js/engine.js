@@ -1,31 +1,40 @@
 'use strict';
-// Chess AI engine — ES module, runs on the main thread
-// Implements iterative-deepening alpha-beta with transposition table and quiescence search
+// Chess AI engine — iterative deepening alpha-beta with:
+//   • Abort-on-timeout (only completes full iterations)
+//   • Transposition table with move storage
+//   • Killer moves (2 per ply)
+//   • History heuristic
+//   • Null-move pruning (R=3 deep, R=2 shallow)
+//   • Late-move reduction (LMR)
+//   • Aspiration windows in iterative deepening
 
 import {
-  generateMoves, makeMove, getLegalMoves, isInCheck, evaluatePosition, opposite
+  generateMoves, makeMove, getLegalMoves, isInCheck,
+  evaluatePosition, opposite
 } from './chess.js';
 
 import { evaluate as nnEvaluate, isReady as nnIsReady } from './neural.js';
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const MAX_DEPTH  = 12;
+const MAX_DEPTH  = 14;
 const MATE_SCORE = 5000;
-const MV_VAL     = [0, 1, 3, 3, 5, 9, 10]; // abs(piece code) → value for MVV-LVA
+const GAMMA_NET  = 0.95;
+// Piece values for MVV-LVA and SEE (indexed by abs piece code)
+const MV_VAL = [0, 100, 320, 330, 500, 900, 20000];
 
 // ── Transposition Table ────────────────────────────────────────────────────
-const TT_SIZE  = 1 << 19; // 524288
-const TT_MASK  = TT_SIZE - 1;
+const TT_SIZE = 1 << 20; // 1 048 576 entries (~16 MB)
+const TT_MASK = TT_SIZE - 1;
 const ttKeyLo  = new Uint32Array(TT_SIZE);
 const ttKeyHi  = new Uint32Array(TT_SIZE);
 const ttScore  = new Int32Array(TT_SIZE);
 const ttDepth  = new Uint8Array(TT_SIZE);
-const ttFlag   = new Uint8Array(TT_SIZE); // 0=exact, 1=lower, 2=upper
+const ttFlag   = new Uint8Array(TT_SIZE); // 0=exact 1=lower 2=upper
+const ttMoves  = new Array(TT_SIZE).fill(null); // best move per entry
 
-// ── Zobrist Hashing ────────────────────────────────────────────────────────
+// ── Zobrist Keys ───────────────────────────────────────────────────────────
 const ZLO = new Uint32Array(769); // 768 piece-square + 1 side-to-move
 const ZHI = new Uint32Array(769);
-
 (function() {
   let s = 7;
   const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
@@ -33,116 +42,160 @@ const ZHI = new Uint32Array(769);
 })();
 
 function zIdx(piece, r, c) {
-  const plane = piece > 0 ? piece - 1 : 6 + (-piece) - 1;
-  return plane * 64 + r * 8 + c;
+  return (piece > 0 ? piece - 1 : 6 + (-piece) - 1) * 64 + r * 8 + c;
 }
 
 function computeZobrist(state) {
   let lo = 0, hi = 0;
-  const board = state.board;
   for (let r = 0; r < 8; r++)
     for (let c = 0; c < 8; c++) {
-      const p = board[r][c];
-      if (p !== 0) { const i = zIdx(p, r, c); lo ^= ZLO[i]; hi ^= ZHI[i]; }
+      const p = state.board[r][c];
+      if (p) { const i = zIdx(p,r,c); lo ^= ZLO[i]; hi ^= ZHI[i]; }
     }
   return [lo, hi];
 }
 
-function updateZobrist(lo, hi, mv, state) {
-  const [fr, fc] = mv.from;
-  const [tr, tc] = mv.to;
-  const piece = mv.piece;
-  // Determine original piece at from-square (before promotion changes the code)
-  const origPiece = state.board[fr][fc];
+function updateZobrist(lo, hi, mv, board) {
+  const [fr,fc] = mv.from, [tr,tc] = mv.to;
+  const orig = board[fr][fc]; // original piece at source (before promotion)
 
-  // Remove piece from source
-  const iFrom = zIdx(origPiece, fr, fc);
+  const iFrom = zIdx(orig, fr, fc);
   lo ^= ZLO[iFrom]; hi ^= ZHI[iFrom];
 
-  // Remove captured piece
-  if (mv.captured !== 0) {
-    if (mv.enPassant) {
-      // En passant: captured pawn is on the same row as the attacker
-      const iCap = zIdx(mv.captured, fr, tc);
-      lo ^= ZLO[iCap]; hi ^= ZHI[iCap];
-    } else {
-      const iCap = zIdx(mv.captured, tr, tc);
-      lo ^= ZLO[iCap]; hi ^= ZHI[iCap];
-    }
+  if (mv.captured) {
+    const capR = mv.enPassant ? fr : tr;
+    const capC = tc;
+    const iCap = zIdx(mv.captured, capR, capC);
+    lo ^= ZLO[iCap]; hi ^= ZHI[iCap];
   }
 
-  // Place piece at destination
-  const iTo = zIdx(piece, tr, tc);
+  const iTo = zIdx(mv.piece, tr, tc);
   lo ^= ZLO[iTo]; hi ^= ZHI[iTo];
 
-  // Castling rook movements
   if (mv.castle) {
-    if (tr === 7 && tc === 6) { lo ^= ZLO[zIdx(4,7,7)] ^ ZLO[zIdx(4,7,5)]; hi ^= ZHI[zIdx(4,7,7)] ^ ZHI[zIdx(4,7,5)]; }
-    if (tr === 7 && tc === 2) { lo ^= ZLO[zIdx(4,7,0)] ^ ZLO[zIdx(4,7,3)]; hi ^= ZHI[zIdx(4,7,0)] ^ ZHI[zIdx(4,7,3)]; }
-    if (tr === 0 && tc === 6) { lo ^= ZLO[zIdx(-4,0,7)] ^ ZLO[zIdx(-4,0,5)]; hi ^= ZHI[zIdx(-4,0,7)] ^ ZHI[zIdx(-4,0,5)]; }
-    if (tr === 0 && tc === 2) { lo ^= ZLO[zIdx(-4,0,0)] ^ ZLO[zIdx(-4,0,3)]; hi ^= ZHI[zIdx(-4,0,0)] ^ ZHI[zIdx(-4,0,3)]; }
+    if (tr===7&&tc===6){lo^=ZLO[zIdx(4,7,7)]^ZLO[zIdx(4,7,5)];hi^=ZHI[zIdx(4,7,7)]^ZHI[zIdx(4,7,5)];}
+    if (tr===7&&tc===2){lo^=ZLO[zIdx(4,7,0)]^ZLO[zIdx(4,7,3)];hi^=ZHI[zIdx(4,7,0)]^ZHI[zIdx(4,7,3)];}
+    if (tr===0&&tc===6){lo^=ZLO[zIdx(-4,0,7)]^ZLO[zIdx(-4,0,5)];hi^=ZHI[zIdx(-4,0,7)]^ZHI[zIdx(-4,0,5)];}
+    if (tr===0&&tc===2){lo^=ZLO[zIdx(-4,0,0)]^ZLO[zIdx(-4,0,3)];hi^=ZHI[zIdx(-4,0,0)]^ZHI[zIdx(-4,0,3)];}
   }
 
-  // Side-to-move flip
-  lo ^= ZLO[768]; hi ^= ZHI[768];
-
+  lo ^= ZLO[768]; hi ^= ZHI[768]; // flip side-to-move
   return [lo, hi];
 }
 
-// ── Move Ordering ──────────────────────────────────────────────────────────
-function sortMoves(moves) {
+// ── Search Heuristic Tables ────────────────────────────────────────────────
+const MAX_PLY = 64;
+// Killer moves: [ply][0|1]
+const killers = Array.from({length: MAX_PLY}, () => [null, null]);
+// History: keyed by (piece+6)*64 + to_square → higher = better quiet move
+const historyTable = new Int32Array(13 * 64);
+
+function histIdx(mv) { return (mv.piece + 6) * 64 + mv.to[0] * 8 + mv.to[1]; }
+
+function addKiller(mv, ply) {
+  if (ply >= MAX_PLY) return;
+  const k = killers[ply];
+  if (!mvEq(k[0], mv)) { k[1] = k[0]; k[0] = mv; }
+}
+
+function addHistory(mv, depth) {
+  const i = histIdx(mv);
+  historyTable[i] += depth * depth;
+  if (historyTable[i] > 32000) {
+    for (let j = 0; j < historyTable.length; j++) historyTable[j] >>= 2;
+  }
+}
+
+function mvEq(a, b) {
+  return a && b &&
+    a.from[0] === b.from[0] && a.from[1] === b.from[1] &&
+    a.to[0]   === b.to[0]   && a.to[1]   === b.to[1]   &&
+    a.piece   === b.piece;
+}
+
+// ── Move Scoring & Sorting ─────────────────────────────────────────────────
+function scoreMove(mv, ply, ttMv) {
+  if (mvEq(mv, ttMv))       return 10_000_000; // TT move first
+  if (mv.captured || mv.enPassant) {
+    const vic = MV_VAL[Math.abs(mv.captured || 1)];
+    const att = MV_VAL[Math.abs(mv.piece)];
+    return 1_000_000 + vic * 10 - att;          // MVV-LVA for captures
+  }
+  if (mv.promotion)          return 900_000;
+  const k = killers[ply < MAX_PLY ? ply : 0];
+  if (mvEq(mv, k[0]))       return 800_000;
+  if (mvEq(mv, k[1]))       return 700_000;
+  return historyTable[histIdx(mv)];              // history heuristic
+}
+
+function sortMoves(moves, ply, ttMv) {
   const n = moves.length;
-  const scores = new Int32Array(n);
-  for (let i = 0; i < n; i++) {
-    const mv = moves[i];
-    if (mv.captured !== 0) scores[i] = 10 * MV_VAL[Math.abs(mv.captured)] - MV_VAL[Math.abs(mv.piece)];
-  }
-  // Insertion sort (small arrays, captures first)
+  const sc = new Int32Array(n);
+  for (let i = 0; i < n; i++) sc[i] = scoreMove(moves[i], ply, ttMv);
+  // Insertion sort — fast for small arrays typical in chess
   for (let i = 1; i < n; i++) {
-    const s = scores[i], m = moves[i];
+    const s = sc[i], m = moves[i];
     let j = i - 1;
-    while (j >= 0 && scores[j] < s) { scores[j+1] = scores[j]; moves[j+1] = moves[j]; j--; }
-    scores[j+1] = s; moves[j+1] = m;
+    while (j >= 0 && sc[j] < s) { sc[j+1] = sc[j]; moves[j+1] = moves[j]; j--; }
+    sc[j+1] = s; moves[j+1] = m;
   }
-  return moves;
 }
 
 // ── Evaluation ─────────────────────────────────────────────────────────────
-const GAMMA_NET = 0.95;
-
 function evalPosition(state, useNN) {
-  let val = evaluatePosition(state); // material+positional, Black=positive
-
+  let val = evaluatePosition(state);
   if (useNN && nnIsReady()) {
-    const nnScore = nnEvaluate(state.board); // White perspective
-    if (nnScore !== null) val -= GAMMA_NET * nnScore;
+    const s = nnEvaluate(state.board);
+    if (s !== null) val -= GAMMA_NET * s;
   }
   return val;
 }
 
+// ── Endgame detection (suppress null-move in low-material positions) ───────
+function isEndgame(board) {
+  let major = 0;
+  for (let r = 0; r < 8; r++)
+    for (let c = 0; c < 8; c++) {
+      const p = Math.abs(board[r][c]);
+      if (p >= 2 && p <= 5) major++;
+    }
+  return major <= 4;
+}
+
 // ── Quiescence Search ──────────────────────────────────────────────────────
-function quiescence(state, lo, hi, alpha, beta, side, useNN) {
-  const standPat = evalPosition(state, useNN);
+function quiescence(state, lo, hi, alpha, beta, side, useNN, qDepth) {
+  if (aborted) return 0;
+
   const maximize = side === 'black';
+  const standPat = evalPosition(state, useNN);
 
   if (maximize) {
-    if (standPat >= beta) return standPat;
+    if (standPat >= beta) return beta;
     if (standPat > alpha) alpha = standPat;
   } else {
-    if (standPat <= alpha) return standPat;
+    if (standPat <= alpha) return alpha;
     if (standPat < beta) beta = standPat;
   }
 
-  const moves = generateMoves(state, side)
-    .filter(mv => mv.captured !== 0 || mv.enPassant);
-  sortMoves(moves);
+  // Delta pruning: skip if no capture can possibly improve
+  const DELTA = 1000;
+  if (maximize && standPat < alpha - DELTA) return alpha;
+  if (!maximize && standPat > beta + DELTA)  return beta;
+
+  // Limit quiescence depth to avoid explosion
+  if (qDepth <= 0) return standPat;
+
+  const caps = generateMoves(state, side).filter(mv => mv.captured || mv.enPassant);
+  sortMoves(caps, 0, null);
 
   let best = standPat;
-  for (const mv of moves) {
+  for (const mv of caps) {
+    if (aborted) break;
     const child = makeMove(state, mv);
     if (isInCheck(child, side)) continue;
-    const [nlo, nhi] = updateZobrist(lo, hi, mv, state);
-    const score = quiescence(child, nlo, nhi, alpha, beta, opposite(side), useNN);
+    const [nlo, nhi] = updateZobrist(lo, hi, mv, state.board);
+    const score = quiescence(child, nlo, nhi, alpha, beta, opposite(side), useNN, qDepth - 1);
+
     if (maximize) {
       if (score > best) best = score;
       if (score > alpha) alpha = score;
@@ -155,39 +208,104 @@ function quiescence(state, lo, hi, alpha, beta, side, useNN) {
   return best;
 }
 
-// ── Alpha-Beta ─────────────────────────────────────────────────────────────
-function search(state, lo, hi, depth, alpha, beta, side, ply, useNN) {
+// ── Alpha-Beta Search ──────────────────────────────────────────────────────
+let aborted      = false;
+let startTime    = 0;
+let timeLimitMs  = 5000;
+let nodeCount    = 0;
+
+function search(state, lo, hi, depth, alpha, beta, side, ply, useNN, isNullMove) {
+  // Periodic time check (every 2048 nodes to keep overhead low)
+  if ((++nodeCount & 2047) === 0 && Date.now() - startTime >= timeLimitMs) {
+    aborted = true;
+  }
+  if (aborted) return [null, 0];
+
   const maximize = side === 'black';
   const idx = (lo >>> 0) & TT_MASK;
+  let ttMv = null;
 
-  // TT lookup
-  if (ttKeyLo[idx] === lo && ttKeyHi[idx] === hi && ttDepth[idx] >= depth) {
-    const ts = ttScore[idx], tf = ttFlag[idx];
-    if (tf === 0) return [null, ts];
-    if (tf === 1 && ts >= beta) return [null, ts];
-    if (tf === 2 && ts <= alpha) return [null, ts];
+  // Transposition table probe
+  if (ttKeyLo[idx] === lo && ttKeyHi[idx] === hi) {
+    ttMv = ttMoves[idx];
+    if (ttDepth[idx] >= depth) {
+      const ts = ttScore[idx], tf = ttFlag[idx];
+      if (tf === 0) return [ttMv, ts];
+      if (tf === 1 && ts >= beta)  return [ttMv, ts];
+      if (tf === 2 && ts <= alpha) return [ttMv, ts];
+    }
   }
 
-  if (depth === 0) return [null, quiescence(state, lo, hi, alpha, beta, side, useNN)];
+  // Leaf node → quiescence
+  if (depth <= 0) return [null, quiescence(state, lo, hi, alpha, beta, side, useNN, 6)];
+
+  const inCheck = isInCheck(state, side);
+
+  // Check extension: don't reduce depth when in check
+  if (inCheck) depth++;
+
+  // Null-move pruning (skip if: in check, null move already done, endgame, shallow depth)
+  if (!isNullMove && !inCheck && depth >= 3 && !isEndgame(state.board)) {
+    const R = depth >= 6 ? 3 : 2;
+    const nullState = { ...state, enPassantTarget: null, _sideToMove: opposite(side) };
+    const [nlo, nhi] = [lo ^ ZLO[768], hi ^ ZHI[768]];
+    const [, ns] = search(nullState, nlo, nhi, depth - R - 1, alpha, beta, opposite(side), ply + 1, false, true);
+    if (!aborted) {
+      if (maximize && ns >= beta) return [null, beta];
+      if (!maximize && ns <= alpha) return [null, alpha];
+    }
+  }
 
   const legal = getLegalMoves(state, side);
+
   if (legal.length === 0) {
-    if (isInCheck(state, side)) {
-      return [null, maximize ? (-MATE_SCORE + ply) : (MATE_SCORE - ply)];
-    }
-    return [null, 0]; // stalemate
+    return [null, inCheck
+      ? (maximize ? -MATE_SCORE + ply : MATE_SCORE - ply)
+      : 0];
   }
 
-  sortMoves(legal);
+  sortMoves(legal, ply, ttMv);
 
   let bestMove = null;
   let bestScore = maximize ? -Infinity : Infinity;
   const origAlpha = alpha, origBeta = beta;
 
-  for (const mv of legal) {
+  for (let i = 0; i < legal.length; i++) {
+    if (aborted) break;
+    const mv = legal[i];
     const child = makeMove(state, mv);
-    const [nlo, nhi] = updateZobrist(lo, hi, mv, state);
-    const [, score] = search(child, nlo, nhi, depth - 1, alpha, beta, opposite(side), ply + 1, useNN);
+    const [nlo, nhi] = updateZobrist(lo, hi, mv, state.board);
+    const isCapOrPromo = mv.captured || mv.enPassant || mv.promotion;
+    const givesCheck = isInCheck(child, opposite(side));
+
+    let score;
+
+    // Late Move Reduction: quiet, non-checking, non-first moves at depth >= 3
+    const doLMR = depth >= 3 && i >= 3 && !isCapOrPromo && !givesCheck && !inCheck;
+    if (doLMR) {
+      // Reduction amount scales with move index and depth
+      const R = 1 + (i >= 6 ? 1 : 0) + (depth >= 8 && i >= 12 ? 1 : 0);
+      // Reduced search with a null window
+      let nullAlpha = maximize ? alpha     : beta - 1;
+      let nullBeta  = maximize ? alpha + 1 : beta;
+      const [, lmrScore] = search(child, nlo, nhi, depth - 1 - R, nullAlpha, nullBeta, opposite(side), ply + 1, useNN, false);
+
+      if (aborted) break;
+
+      // If LMR score improves alpha (and we didn't prune), re-search at full depth
+      const needFull = maximize ? lmrScore > alpha : lmrScore < beta;
+      if (needFull) {
+        const [, full] = search(child, nlo, nhi, depth - 1, alpha, beta, opposite(side), ply + 1, useNN, false);
+        score = full;
+      } else {
+        score = lmrScore;
+      }
+    } else {
+      const [, s] = search(child, nlo, nhi, depth - 1, alpha, beta, opposite(side), ply + 1, useNN, false);
+      score = s;
+    }
+
+    if (aborted) break;
 
     if (maximize) {
       if (score > bestScore) { bestScore = score; bestMove = mv; }
@@ -196,29 +314,92 @@ function search(state, lo, hi, depth, alpha, beta, side, ply, useNN) {
       if (score < bestScore) { bestScore = score; bestMove = mv; }
       if (score < beta) beta = score;
     }
-    if (alpha >= beta) break;
+
+    if (alpha >= beta) {
+      // Beta cutoff — record in heuristic tables
+      if (!isCapOrPromo) {
+        addKiller(mv, ply);
+        addHistory(mv, depth);
+      }
+      break;
+    }
   }
 
-  // Store in TT
-  ttKeyLo[idx] = lo; ttKeyHi[idx] = hi;
-  ttScore[idx] = bestScore; ttDepth[idx] = depth;
-  ttFlag[idx] = bestScore <= origAlpha ? 2 : bestScore >= origBeta ? 1 : 0;
+  // Store result in TT
+  if (!aborted) {
+    ttKeyLo[idx] = lo; ttKeyHi[idx] = hi;
+    ttScore[idx] = bestScore; ttDepth[idx] = Math.min(depth, 255);
+    ttMoves[idx] = bestMove;
+    ttFlag[idx] = bestScore <= origAlpha ? 2 : bestScore >= origBeta ? 1 : 0;
+  }
 
   return [bestMove, bestScore];
 }
 
 // ── Iterative Deepening ────────────────────────────────────────────────────
 export function searchBestMove(state, timeLimit, useNN) {
-  const t0 = Date.now();
+  startTime   = Date.now();
+  timeLimitMs = timeLimit;
+  aborted     = false;
+  nodeCount   = 0;
+
+  // Reset per-search heuristics (keep history across moves — it's global knowledge)
+  for (let i = 0; i < MAX_PLY; i++) { killers[i][0] = null; killers[i][1] = null; }
+
   const side = state._sideToMove || 'black';
   const [lo, hi] = computeZobrist(state);
   let bestMove = null;
+  let prevScore = 0;
+
+  // Aspiration window parameters
+  const ASP_DELTA = 50;
 
   for (let depth = 1; depth <= MAX_DEPTH; depth++) {
-    if (Date.now() - t0 >= timeLimit) break;
-    const [mv, score] = search(state, lo, hi, depth, -Infinity, Infinity, side, 0, useNN);
-    if (mv) bestMove = mv;
+    aborted = false;
+
+    // Aspiration windows: start with narrow window, widen on fail
+    let alpha, beta;
+    if (depth <= 4) {
+      // Full window for first few depths (too shallow for aspiration)
+      alpha = -Infinity; beta = Infinity;
+    } else {
+      alpha = prevScore - ASP_DELTA;
+      beta  = prevScore + ASP_DELTA;
+    }
+
+    let mv, score;
+    let aspirationFailed = false;
+
+    while (true) {
+      aborted = false;
+      [mv, score] = search(state, lo, hi, depth, alpha, beta, side, 0, useNN, false);
+
+      if (aborted) { aspirationFailed = true; break; }
+
+      if (score <= alpha) {
+        // Fail low — widen window down
+        alpha = Math.max(alpha - ASP_DELTA * 4, -Infinity);
+      } else if (score >= beta) {
+        // Fail high — widen window up
+        beta = Math.min(beta + ASP_DELTA * 4, Infinity);
+      } else {
+        break; // Within window — search is reliable
+      }
+    }
+
+    if (!aspirationFailed && mv) {
+      bestMove = mv;
+      prevScore = score;
+    }
+
+    // Stop if we've found a forced mate
     if (Math.abs(score) >= MATE_SCORE - 100) break;
+
+    // Time management: don't start the next iteration if we've used ≥ 65% of time,
+    // because deeper iterations typically take 3–5× longer
+    const elapsed = Date.now() - startTime;
+    if (elapsed >= timeLimitMs * 0.65) break;
   }
+
   return bestMove;
 }

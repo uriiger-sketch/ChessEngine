@@ -7,11 +7,13 @@
 const PIECE_VALUES = [0, 100, 320, 330, 500, 900, 0]; // index by abs(piece code)
 const SIMPLE_VALUES = [0, 1, 3, 3, 5, 9, 0];
 
-// Indexed as PIECE_GLYPHS[code + 6] where code is -6..+6
-const PIECE_GLYPHS_ARR = ['♚','♛','♜','♝','♞','♟','','♙','♘','♗','♖','♕','♔'];
-const PIECE_GLYPHS = Object.fromEntries(
-  PIECE_GLYPHS_ARR.map((g, i) => [i - 6, g])
-);
+// Both sides use the SAME outline glyphs — CSS classes handle color differentiation
+const _PT_GLYPHS = ['', '♙', '♘', '♗', '♖', '♕', '♔']; // index = abs(piece code)
+const PIECE_GLYPHS = {};
+for (let pt = 0; pt <= 6; pt++) {
+  PIECE_GLYPHS[pt]  = _PT_GLYPHS[pt]; // white piece codes  0..6
+  PIECE_GLYPHS[-pt] = _PT_GLYPHS[pt]; // black piece codes -6..0 → same glyph
+}
 
 // Piece-square tables (from White's perspective, row 0 = rank 8, row 7 = rank 1)
 const PST = {
@@ -393,6 +395,7 @@ function evaluatePosition(st) {
   val += rookFileScore(board);
   val += kingSafety(board);
   val += pawnStructure(board);
+  val += passedPawns(board);
   return val;
 }
 
@@ -442,15 +445,54 @@ function kingSafety(board) {
 }
 
 function pawnStructure(board) {
+  // score positive = good for Black
+  const wFile = new Int8Array(8), bFile = new Int8Array(8);
+  for (let r = 0; r < 8; r++)
+    for (let c = 0; c < 8; c++) {
+      if (board[r][c] === 1)  wFile[c]++;
+      if (board[r][c] === -1) bFile[c]++;
+    }
+
   let score = 0;
   for (let c = 0; c < 8; c++) {
-    let wCount = 0, bCount = 0;
-    for (let r = 0; r < 8; r++) {
-      if (board[r][c] === 1) wCount++;
-      if (board[r][c] === -1) bCount++;
+    // Doubled pawn penalty
+    if (wFile[c] > 1) score += (wFile[c] - 1) * 20;
+    if (bFile[c] > 1) score -= (bFile[c] - 1) * 20;
+    // Isolated pawn penalty (no friendly pawns on adjacent files)
+    const wAdj = (c > 0 && wFile[c-1]) || (c < 7 && wFile[c+1]);
+    const bAdj = (c > 0 && bFile[c-1]) || (c < 7 && bFile[c+1]);
+    if (wFile[c] && !wAdj) score += 25; // isolated white pawn = bad for white = good for black
+    if (bFile[c] && !bAdj) score -= 25;
+  }
+  return score;
+}
+
+function passedPawns(board) {
+  // Passed pawn: no enemy pawns on same or adjacent files ahead of it
+  // score positive = good for Black
+  let score = 0;
+  for (let c = 0; c < 8; c++) {
+    for (let r = 1; r < 7; r++) {
+      if (board[r][c] === 1) { // White pawn; it advances toward row 0
+        let passed = true;
+        outer: for (let rr = 0; rr < r; rr++)
+          for (let cc = Math.max(0,c-1); cc <= Math.min(7,c+1); cc++)
+            if (board[rr][cc] === -1) { passed = false; break outer; }
+        if (passed) {
+          const advance = 7 - r; // rows from starting rank (1=rank3 to 5=rank7)
+          score -= advance * 18; // white passed pawn = good for white = bad for black
+        }
+      } else if (board[r][c] === -1) { // Black pawn; advances toward row 7
+        let passed = true;
+        outer: for (let rr = r + 1; rr < 8; rr++)
+          for (let cc = Math.max(0,c-1); cc <= Math.min(7,c+1); cc++)
+            if (board[rr][cc] === 1) { passed = false; break outer; }
+        if (passed) {
+          const advance = r;
+          score += advance * 18;
+        }
+      }
     }
-    if (wCount > 1) score += (wCount - 1) * 20; // doubled pawn penalty (from black perspective)
-    if (bCount > 1) score -= (bCount - 1) * 20;
   }
   return score;
 }
