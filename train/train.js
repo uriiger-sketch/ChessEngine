@@ -16,13 +16,31 @@ const PGN_FILES = [
   '4Capablanca.pgn', '5Kasparov.pgn', '6Nakamura.pgn', '7Tal.pgn'
 ];
 
-const BATCH_SIZE    = 5000;
-const BATCH_EPOCHS  = 5;   // more epochs per batch for deeper learning
+// ── Hyperparameters ────────────────────────────────────────────────────────
+// Label design (this is the part that decides whether the net is any good):
+//
+//   label = materialBalance + RESULT_BONUS × gameResult × phaseRamp
+//
+// Material is the backbone: it is exactly computable and therefore perfectly
+// learnable, which anchors the network in reality. The game result is layered
+// on top only as a small positional nudge — it encodes "masters who reached
+// this kind of position went on to win", which is real signal, but at the
+// level of a single position the eventual result is mostly noise. Scaling the
+// result term to a whole-game-deciding magnitude makes that noise swamp the
+// material signal and the network learns nothing useful, so RESULT_BONUS is
+// deliberately kept to roughly a piece-fragment of advantage.
+const RESULT_BONUS  = 1.5;   // pawn-units of positional credit for winning
+const Y_SCALE       = 10;    // labels normalised by ±10 pawns
+const Y_CLAMP       = 10;    // clamp labels to the normalised range
+
+const EPOCHS        = 8;
+const BATCH_SIZE    = 512;
 const LEARNING_RATE = 0.001;
-const Y_MAX = 39;          // label clamp in pawn-units
-const Y_MIN = -39;
-const SAMPLE_RATE   = 0.5; // sample 50% of positions (was 25%)
-const SKIP_PLY      = 10;  // ignore first 10 half-moves (too similar across games)
+const VAL_FRACTION  = 0.02;  // held-out set to measure real generalisation
+const SAMPLE_RATE   = 0.35;  // fraction of positions kept per game
+const SKIP_PLY      = 8;     // ignore opening book plies (identical across games)
+const MAX_POSITIONS = 1_400_000;
+const MAX_PIECES    = 32;    // slots per position in the sparse store
 
 // ── Chess Board Logic ──────────────────────────────────────────────────────
 
@@ -299,6 +317,94 @@ function boardToVector(board) {
   return vec;
 }
 
+// ── Sparse Position Store ──────────────────────────────────────────────────
+// A dense 768-float row per position would need ~4 GB for a million positions.
+// Only ≤32 squares are ever occupied, so each position is stored as its list
+// of set input indices and expanded to a dense row per batch.
+
+class PositionStore {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.idx    = new Uint16Array(capacity * MAX_PIECES);
+    this.counts = new Uint8Array(capacity);
+    this.labels = new Float32Array(capacity);
+    this.n = 0;
+  }
+
+  add(board, label) {
+    if (this.n >= this.capacity) return false;
+    const base = this.n * MAX_PIECES;
+    let k = 0;
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = board[r][c];
+        if (p === 0 || k >= MAX_PIECES) continue;
+        const plane = p > 0 ? p - 1 : 5 + (-p);   // W P..K = 0..5, B p..k = 6..11
+        this.idx[base + k++] = plane * 64 + r * 8 + c;
+      }
+    }
+    this.counts[this.n] = k;
+    this.labels[this.n] = label;
+    this.n++;
+    return true;
+  }
+}
+
+// Colour-mirror an input index: flip the board vertically and swap piece
+// colours. Applied with the label negated, this teaches the network that chess
+// is colour-symmetric — without it the net happily scores the symmetric start
+// position as a large advantage for one side.
+function mirrorIndex(i) {
+  const plane = (i / 64) | 0;
+  const sq    = i % 64;
+  const r     = (sq / 8) | 0;
+  const c     = sq % 8;
+  const mPlane = plane < 6 ? plane + 6 : plane - 6;
+  return mPlane * 64 + (7 - r) * 8 + c;
+}
+
+// Expand a range of stored positions into a dense batch.
+//
+// Inputs stay as sparse 0/1 rather than being rescaled to ±1. That matters a
+// lot: with ±1 the 736 empty squares become a constant −1 background that
+// dominates every gradient, and the network fails to learn even exact material
+// (measured: 2.52 pawns RMSE with ±1 vs 0.61 with 0/1 on the same task).
+// js/neural.js uses the identical encoding at runtime.
+function buildBatch(store, order, from, to, mirror) {
+  const rows = to - from;
+  const xs = new Float32Array(rows * 768);
+  const ys = new Float32Array(rows);
+  for (let b = 0; b < rows; b++) {
+    const p    = order[from + b];
+    const base = p * MAX_PIECES;
+    const cnt  = store.counts[p];
+    const flip = mirror && (b & 1) === 0;      // mirror half of every batch
+    const off  = b * 768;
+    for (let k = 0; k < cnt; k++) {
+      const i = store.idx[base + k];
+      xs[off + (flip ? mirrorIndex(i) : i)] = 1;
+    }
+    ys[b] = (flip ? -store.labels[p] : store.labels[p]) / Y_SCALE;
+  }
+  return { xs, ys, rows };
+}
+
+function shuffleInPlace(arr, rand) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+}
+
+// Deterministic RNG so training runs are reproducible.
+function makeRand(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
 // ── Model Definition ───────────────────────────────────────────────────────
 
 function createModel() {
@@ -308,84 +414,80 @@ function createModel() {
   m.add(tf.layers.dense({ units:  64, activation: 'relu' }));
   m.add(tf.layers.dense({ units:  32, activation: 'relu' }));
   m.add(tf.layers.dense({ units:   1, activation: 'linear' }));
-  m.compile({
-    optimizer: tf.train.adam(LEARNING_RATE),
-    loss: 'meanSquaredError'
-  });
+  m.compile({ optimizer: tf.train.adam(LEARNING_RATE), loss: 'meanSquaredError' });
   return m;
 }
 
-// ── Training Loop ──────────────────────────────────────────────────────────
+// ── Sanity Probes ──────────────────────────────────────────────────────────
+// A good evaluation net must score the symmetric start position near zero and
+// must move decisively in the right direction when material is removed.
 
-async function trainBatch(model, xArr, yArr) {
-  // Inputs: [0,1] → [-1,+1]; labels: pawn-units → [-1,+1]
-  const xNorm = xArr.map(v => v * 2 - 1);
-  const yNorm = yArr.map(v => v / Y_MAX);
-
-  const xs = tf.tensor2d(xNorm, [yArr.length, 768]);
-  const ys = tf.tensor2d(yNorm, [yArr.length, 1]);
-  const h  = await model.fit(xs, ys, {
-    epochs: BATCH_EPOCHS,
-    batchSize: 256,
-    shuffle: true,
-    verbose: 0
-  });
-  xs.dispose(); ys.dispose();
-  return h.history.loss[h.history.loss.length - 1];
+function probeBoards() {
+  const start = initState().board;
+  const clone = b => b.map(r => [...r]);
+  const noBQ = clone(start); noBQ[0][3] = 0;
+  const noWQ = clone(start); noWQ[7][3] = 0;
+  const noBR = clone(start); noBR[0][0] = 0; noBR[0][7] = 0;
+  const noWN = clone(start); noWN[7][1] = 0; noWN[7][6] = 0;
+  return [
+    ['start position (expect ~0.0)',      start, 0],
+    ['black queen removed (expect ~+9)',  noBQ,  9],
+    ['white queen removed (expect ~-9)',  noWQ, -9],
+    ['both black rooks gone (expect ~+10)', noBR, 10],
+    ['both white knights gone (expect ~-6)', noWN, -6],
+  ];
 }
 
-async function main() {
-  console.log('ChessNN Training Script (with game-result labels)');
-  console.log('==================================================');
-  console.log(`Batch size: ${BATCH_SIZE}, Epochs/batch: ${BATCH_EPOCHS}`);
-  console.log(`Sample rate: ${SAMPLE_RATE * 100}%, Skip first ${SKIP_PLY} ply`);
-  console.log(`PGN files: ${PGN_FILES.join(', ')}\n`);
+function runProbes(model) {
+  const probes = probeBoards();
+  const xs = new Float32Array(probes.length * 768);
+  probes.forEach(([, board], bi) => {
+    for (let r = 0; r < 8; r++)
+      for (let c = 0; c < 8; c++) {
+        const p = board[r][c];
+        if (p !== 0) {
+          const plane = p > 0 ? p - 1 : 5 + (-p);
+          xs[bi * 768 + plane * 64 + r * 8 + c] = 1;
+        }
+      }
+  });
+  const t = tf.tensor2d(xs, [probes.length, 768]);
+  const out = model.predict(t);
+  const vals = out.dataSync();
+  t.dispose(); out.dispose();
 
-  if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
+  console.log('\nSanity probes (pawn units, + = White better):');
+  let allGood = true;
+  probes.forEach(([label, , expected], i) => {
+    const got = vals[i] * Y_SCALE;
+    const ok = Math.abs(got - expected) <= Math.max(2.5, Math.abs(expected) * 0.45);
+    if (!ok) allGood = false;
+    console.log(`  ${ok ? 'OK  ' : 'BAD '} ${label.padEnd(40)} → ${got >= 0 ? '+' : ''}${got.toFixed(2)}`);
+  });
+  return allGood;
+}
 
-  const model = createModel();
-  model.summary();
+// ── Data Collection ────────────────────────────────────────────────────────
 
-  let xBuf = new Float32Array(BATCH_SIZE * 768);
-  let yBuf = new Float32Array(BATCH_SIZE);
-  let nInBatch = 0;
-  let totalPositions = 0;
-  let totalGames = 0;
-  let batchCount = 0;
-  let lastLoss = null;
-  let wonGames = 0, lostGames = 0, drawnGames = 0;
-
-  async function flushBatch() {
-    if (nInBatch === 0) return;
-    batchCount++;
-    const xSlice = Array.from(xBuf.slice(0, nInBatch * 768));
-    const ySlice = Array.from(yBuf.slice(0, nInBatch));
-    lastLoss = await trainBatch(model, xSlice, ySlice);
-    nInBatch = 0;
-    console.log(`  Batch ${batchCount}: loss=${lastLoss.toFixed(4)}, total=${totalPositions.toLocaleString()}`);
-  }
+function collectPositions() {
+  const store = new PositionStore(MAX_POSITIONS);
+  const rand = makeRand(12345);
+  let totalGames = 0, parsedGames = 0;
+  let wWins = 0, bWins = 0, draws = 0;
 
   for (const file of PGN_FILES) {
     const filePath = path.join(PGN_DIR, file);
     if (!fs.existsSync(filePath)) { console.warn(`  Skipping ${file} (not found)`); continue; }
 
-    console.log(`\nProcessing ${file}...`);
-    const text = fs.readFileSync(filePath, 'utf8');
-    const games = splitGames(text);
-    console.log(`  Found ${games.length} games`);
-
-    let filePositions = 0;
+    process.stdout.write(`  ${file.padEnd(18)}`);
+    const games = splitGames(fs.readFileSync(filePath, 'utf8'));
+    const before = store.n;
 
     for (const gameText of games) {
-      // ── Parse game result for label blending ────────────────────────────
-      const result = parseResult(gameText); // +1, -1, 0, or null
-      if (result === 1) wonGames++;
-      else if (result === -1) lostGames++;
-      else if (result === 0) drawnGames++;
+      totalGames++;
+      const result = parseResult(gameText);   // +1 White, −1 Black, 0 draw, null unknown
+      if (result === 1) wWins++; else if (result === -1) bWins++; else if (result === 0) draws++;
 
-      const resultScore = result !== null ? result * Y_MAX : null;
-
-      // ── Strip PGN headers and comments ──────────────────────────────────
       const moveText = gameText
         .replace(/\[[^\]]*\]/g, '')
         .replace(/\{[^}]*\}/g, '')
@@ -396,71 +498,145 @@ async function main() {
 
       const tokens = moveText.split(/\s+/)
         .filter(t => t && !/^(1-0|0-1|1\/2-1\/2|\*)$/.test(t));
+      if (tokens.length < SKIP_PLY + 4) continue;
 
       let state = initState();
       let side  = 'white';
-      let ok    = true;
       let ply   = 0;
+      let ok    = true;
 
       for (const token of tokens) {
-        if (!ok) break;
         const san = token.replace(/[+#!?]+$/g, '');
         if (!san) continue;
-
         const mv = sanToMove(san, state, side);
         if (!mv) { ok = false; break; }
         state = makeMove(state, mv);
         ply++;
         side = side === 'white' ? 'black' : 'white';
 
-        // Skip first SKIP_PLY half-moves (opening book positions all look the same)
         if (ply <= SKIP_PLY) continue;
+        if (rand() >= SAMPLE_RATE) continue;
 
-        if (Math.random() >= SAMPLE_RATE) continue;
+        const material = simpleEval(state.board);   // White-positive, pawn units
+        // Positional credit ramps in as the game progresses: near the start the
+        // outcome says little, by move ~40 it reflects a genuine advantage.
+        const ramp  = Math.min(1, (ply - SKIP_PLY) / 60);
+        const bonus = result === null ? 0 : RESULT_BONUS * result * ramp;
+        const label = Math.max(-Y_CLAMP, Math.min(Y_CLAMP, material + bonus));
 
-        const matScore = simpleEval(state.board); // White-perspective, pawn units
-
-        let label;
-        if (resultScore !== null) {
-          // Blend: ramp result weight from 20% at ply 10 → 80% at ply 80+
-          const resultWeight = Math.min(0.8, (ply - SKIP_PLY) / 70 * 0.8 + 0.2);
-          label = resultWeight * resultScore + (1 - resultWeight) * matScore;
-        } else {
-          label = matScore;
-        }
-        label = Math.max(Y_MIN, Math.min(Y_MAX, label));
-
-        const vec = boardToVector(state.board);
-        xBuf.set(vec, nInBatch * 768);
-        yBuf[nInBatch] = label;
-        nInBatch++;
-        totalPositions++;
-        filePositions++;
-
-        if (nInBatch === BATCH_SIZE) await flushBatch();
+        if (!store.add(state.board, label)) break;
       }
-      totalGames++;
+      if (ok) parsedGames++;
+      if (store.n >= store.capacity) break;
     }
-    console.log(`  Collected ${filePositions.toLocaleString()} positions from this file`);
+    console.log(`${(store.n - before).toLocaleString()} positions`);
+    if (store.n >= store.capacity) { console.log('  (position cap reached)'); break; }
   }
 
-  await flushBatch();
+  return { store, totalGames, parsedGames, wWins, bWins, draws };
+}
 
-  console.log(`\nTraining complete!`);
-  console.log(`  Games: ${totalGames.toLocaleString()} (W:${wonGames} D:${drawnGames} B:${lostGames})`);
-  console.log(`  Total positions: ${totalPositions.toLocaleString()}`);
-  console.log(`  Total batches:   ${batchCount}`);
-  if (lastLoss !== null) console.log(`  Final loss:      ${lastLoss.toFixed(4)}`);
+// ── Training ───────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('ChessNN Training');
+  console.log('================');
+  console.log(`Label      : material + ${RESULT_BONUS} × result × phaseRamp  (clamped ±${Y_CLAMP}, scaled by ${Y_SCALE})`);
+  console.log(`Sampling   : ${SAMPLE_RATE * 100}% of plies after ply ${SKIP_PLY}`);
+  console.log(`Training   : ${EPOCHS} epochs, batch ${BATCH_SIZE}, lr ${LEARNING_RATE}`);
+  console.log(`Augment    : colour-mirroring (half of every batch)`);
+  console.log(`PGN files  : ${PGN_FILES.length}\n`);
+
+  if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
+
+  console.log('Reading games...');
+  const t0 = Date.now();
+  const { store, totalGames, parsedGames, wWins, bWins, draws } = collectPositions();
+  console.log(`\n  Games seen      : ${totalGames.toLocaleString()} (fully parsed: ${parsedGames.toLocaleString()})`);
+  console.log(`  Results         : White ${wWins}, Draw ${draws}, Black ${bWins}`);
+  console.log(`  Positions stored: ${store.n.toLocaleString()}`);
+  console.log(`  Collection time : ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+
+  if (store.n < 1000) { console.error('Not enough positions — aborting.'); process.exit(1); }
+
+  // Global shuffle. Streaming batches in file order would let the last author
+  // in the list dominate the final weights.
+  const rand  = makeRand(999);
+  const order = new Uint32Array(store.n);
+  for (let i = 0; i < store.n; i++) order[i] = i;
+  shuffleInPlace(order, rand);
+
+  const valCount   = Math.max(2000, Math.floor(store.n * VAL_FRACTION));
+  const valOrder   = order.slice(0, valCount);
+  const trainOrder = order.slice(valCount);
+  console.log(`  Train / val     : ${trainOrder.length.toLocaleString()} / ${valOrder.length.toLocaleString()}`);
+
+  const model = createModel();
+  model.summary();
+
+  // Baseline: how well does "always predict the dataset mean" do? Any useful
+  // model must beat this comfortably.
+  let mean = 0;
+  for (let i = 0; i < trainOrder.length; i++) mean += store.labels[trainOrder[i]] / Y_SCALE;
+  mean /= trainOrder.length;
+  let baseline = 0;
+  for (let i = 0; i < valOrder.length; i++) {
+    const d = store.labels[valOrder[i]] / Y_SCALE - mean;
+    baseline += d * d;
+  }
+  baseline /= valOrder.length;
+  console.log(`\nBaseline val MSE (predict-the-mean): ${baseline.toFixed(5)}\n`);
+
+  const val = buildBatch(store, valOrder, 0, valOrder.length, false);
+  const valXs = tf.tensor2d(val.xs, [val.rows, 768]);
+  const valYs = tf.tensor2d(val.ys, [val.rows, 1]);
+
+  const CHUNK = 50_000;   // positions expanded to dense form at a time
+  const tTrain = Date.now();
+
+  for (let epoch = 1; epoch <= EPOCHS; epoch++) {
+    shuffleInPlace(trainOrder, rand);
+    let seen = 0, lossSum = 0, lossN = 0;
+
+    for (let start = 0; start < trainOrder.length; start += CHUNK) {
+      const end = Math.min(start + CHUNK, trainOrder.length);
+      const { xs, ys, rows } = buildBatch(store, trainOrder, start, end, true);
+      const xt = tf.tensor2d(xs, [rows, 768]);
+      const yt = tf.tensor2d(ys, [rows, 1]);
+
+      const h = await model.fit(xt, yt, {
+        epochs: 1, batchSize: BATCH_SIZE, shuffle: true, verbose: 0
+      });
+      lossSum += h.history.loss[0]; lossN++;
+      seen += rows;
+      xt.dispose(); yt.dispose();
+
+      process.stdout.write(`\r  epoch ${epoch}/${EPOCHS}  ${seen.toLocaleString()}/${trainOrder.length.toLocaleString()}  loss ${(lossSum / lossN).toFixed(5)}   `);
+    }
+
+    const ev = model.evaluate(valXs, valYs);
+    const valLoss = (Array.isArray(ev) ? ev[0] : ev).dataSync()[0];
+    if (Array.isArray(ev)) ev.forEach(t => t.dispose()); else ev.dispose();
+    console.log(`\r  epoch ${epoch}/${EPOCHS}  train ${(lossSum / lossN).toFixed(5)}  val ${valLoss.toFixed(5)}  (baseline ${baseline.toFixed(5)})        `);
+  }
+
+  console.log(`\nTraining time: ${((Date.now() - tTrain) / 1000 / 60).toFixed(1)} min`);
+
+  const passed = runProbes(model);
+
+  valXs.dispose(); valYs.dispose();
 
   console.log(`\nSaving model to ${MODEL_DIR}...`);
   await model.save(`file://${MODEL_DIR}`);
+  fs.writeFileSync(
+    path.join(MODEL_DIR, 'normalization.json'),
+    JSON.stringify({ xMin: 0, xMax: 1, yMin: -Y_SCALE, yMax: Y_SCALE }, null, 2)
+  );
 
-  const normParams = { xMin: 0, xMax: 1, yMin: Y_MIN, yMax: Y_MAX };
-  fs.writeFileSync(path.join(MODEL_DIR, 'normalization.json'), JSON.stringify(normParams, null, 2));
-
-  console.log('Done! Model saved.');
-  console.log('Serve the project root with any HTTP server to play:');
-  console.log('  cd .. && python3 -m http.server 8080');
+  console.log(passed
+    ? '\nDone — probes passed, model saved.'
+    : '\nDone — model saved, but some probes look off (see above).');
+  console.log('Serve the project root to play:  python3 -m http.server 8080');
 }
 
 main().catch(err => { console.error(err); process.exit(1); });

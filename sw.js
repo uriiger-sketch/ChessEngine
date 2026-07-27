@@ -1,4 +1,5 @@
-const CACHE = 'chess-v1';
+// Bump on every release — a stale cache would keep serving the old JS/model.
+const CACHE = 'chess-v3';
 const ASSETS = [
   '/',
   '/index.html',
@@ -9,11 +10,13 @@ const ASSETS = [
   '/js/neural.js',
   '/js/pgn.js',
   '/js/ui.js',
+  '/js/worker.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
 ];
 
-// Cache model files if they exist
+// The model is required for NN play offline. Inference is pure JS (js/neural.js),
+// so there is no cross-origin script to cache — everything needed is same-origin.
 const MODEL_ASSETS = [
   '/model/model.json',
   '/model/weights.bin',
@@ -43,7 +46,7 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  // Cache-first for same-origin; network for cross-origin (CDN TF.js)
+  // Cache-first for same-origin. Everything the app needs is same-origin.
   if (!e.request.url.startsWith(self.location.origin)) return;
 
   e.respondWith(

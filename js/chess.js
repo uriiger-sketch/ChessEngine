@@ -97,7 +97,8 @@ function initState() {
     bKc: true, bQc: true,   // Black kingside/queenside castling rights
     lastMove: null,          // {from, to, piece, captured}
     selected: null,          // [r, c] currently selected square
-    enPassantTarget: null    // [r, c] square a pawn can capture en passant
+    enPassantTarget: null,   // [r, c] square a pawn can capture en passant
+    halfmoveClock: 0         // plies since last capture or pawn move (50-move rule)
   };
 }
 
@@ -108,7 +109,8 @@ function cloneState(st) {
     bKc: st.bKc, bQc: st.bQc,
     lastMove: st.lastMove ? {...st.lastMove} : null,
     selected: st.selected ? [...st.selected] : null,
-    enPassantTarget: st.enPassantTarget ? [...st.enPassantTarget] : null
+    enPassantTarget: st.enPassantTarget ? [...st.enPassantTarget] : null,
+    halfmoveClock: st.halfmoveClock || 0
   };
 }
 
@@ -336,20 +338,76 @@ function makeMove(st, mv) {
     next.enPassantTarget = [(fr + tr) / 2, tc];
   }
 
+  // Halfmove clock: resets on a capture or any pawn move, else increments.
+  if (mv.captured || mv.enPassant || Math.abs(piece) === 1) next.halfmoveClock = 0;
+  else next.halfmoveClock = (st.halfmoveClock || 0) + 1;
+
   next.lastMove = mv;
   next.selected = null;
   return next;
+}
+
+// Compact key identifying a position for repetition detection. Per FIDE, two
+// positions are the same only if the side to move, castling rights and en
+// passant possibilities also match.
+function positionKey(st, side) {
+  let s = '';
+  for (let r = 0; r < 8; r++) s += st.board[r].join(',') + '/';
+  s += side[0];
+  s += (st.wKc ? 'K' : '') + (st.wQc ? 'Q' : '') + (st.bKc ? 'k' : '') + (st.bQc ? 'q' : '');
+  if (st.enPassantTarget) s += ':' + st.enPassantTarget[0] + st.enPassantTarget[1];
+  return s;
+}
+
+// Draw by insufficient mating material: K v K, K+minor v K, and K+B v K+B with
+// both bishops on the same colour squares.
+function insufficientMaterial(board) {
+  const minors = [];
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = board[r][c];
+      if (p === 0) continue;
+      const pt = Math.abs(p);
+      if (pt === 6) continue;
+      if (pt === 1 || pt === 4 || pt === 5) return false;  // pawn/rook/queen can mate
+      minors.push({ pt, side: Math.sign(p), light: (r + c) % 2 === 0 });
+    }
+  }
+  if (minors.length <= 1) return true;                      // K v K, K+minor v K
+  if (minors.length === 2) {
+    const [a, b] = minors;
+    if (a.pt === 3 && b.pt === 3 && a.side !== b.side && a.light === b.light) return true;
+  }
+  return false;
 }
 
 function getLegalMoves(st, side) {
   return filterLegal(generateMoves(st, side), st, side);
 }
 
-function getGameStatus(st, side) {
+// repCount = how many times the current position has already occurred in the
+// game (1 = first occurrence). Pass it to enable threefold-repetition detection.
+function getGameStatus(st, side, repCount = 1) {
   const legal = getLegalMoves(st, side);
-  if (legal.length > 0) return {over: false, result: null};
-  if (isInCheck(st, side)) return {over: true, result: side === 'white' ? 'black_wins' : 'white_wins'};
-  return {over: true, result: 'draw'};
+
+  if (legal.length === 0) {
+    if (isInCheck(st, side)) {
+      return {over: true, result: side === 'white' ? 'black_wins' : 'white_wins', reason: 'checkmate'};
+    }
+    return {over: true, result: 'draw', reason: 'stalemate'};
+  }
+
+  if (insufficientMaterial(st.board)) {
+    return {over: true, result: 'draw', reason: 'insufficient material'};
+  }
+  if ((st.halfmoveClock || 0) >= 100) {          // 100 plies = 50 full moves
+    return {over: true, result: 'draw', reason: 'fifty-move rule'};
+  }
+  if (repCount >= 3) {
+    return {over: true, result: 'draw', reason: 'threefold repetition'};
+  }
+
+  return {over: false, result: null, reason: null};
 }
 
 function pieceSquareValue(piece, r, c) {
@@ -520,6 +578,6 @@ export {
   initState, cloneState, generateMoves, makeMove, getLegalMoves,
   getGameStatus, isInCheck, squareAttacked, findKing, filterLegal,
   evaluatePosition, simpleEval, boardToVector, opposite, inBounds,
-  pieceSquareValue,
+  pieceSquareValue, positionKey, insufficientMaterial,
   PIECE_GLYPHS, PIECE_VALUES, SIMPLE_VALUES
 };

@@ -18,7 +18,10 @@ import { evaluate as nnEvaluate, isReady as nnIsReady } from './neural.js';
 // ── Constants ──────────────────────────────────────────────────────────────
 const MAX_DEPTH  = 14;
 const MATE_SCORE = 5000;
-const GAMMA_NET  = 0.95;
+// Share of the leaf evaluation taken from the neural net vs the hand-crafted
+// evaluation. The hand eval keeps tactical material accounting exact; the net
+// contributes the positional judgement learned from master games.
+const NN_WEIGHT  = 0.4;
 // Piece values for MVV-LVA and SEE (indexed by abs piece code)
 const MV_VAL = [0, 100, 320, 330, 500, 900, 20000];
 
@@ -142,11 +145,41 @@ function sortMoves(moves, ply, ttMv) {
 }
 
 // ── Evaluation ─────────────────────────────────────────────────────────────
-function evalPosition(state, useNN) {
-  let val = evaluatePosition(state);
+// evaluatePosition() is Black-positive centipawns; the net returns White-positive
+// pawn units, so it needs both a sign flip and a ×100 scale conversion. The two
+// are combined as a weighted blend rather than a sum — adding them would count
+// material twice, and previously the missing ×100 left the net contributing at
+// most ~37cp, i.e. effectively nothing.
+// Network inference costs ~50µs versus ~5µs for the hand evaluation, so leaf
+// scores are memoised by Zobrist key. Searches revisit positions constantly,
+// which makes this cache worth far more than micro-optimising the forward pass.
+const EV_SIZE = 1 << 18;
+const EV_MASK = EV_SIZE - 1;
+const evKeyLo = new Int32Array(EV_SIZE);
+const evKeyHi = new Int32Array(EV_SIZE);
+const evVal   = new Float32Array(EV_SIZE);
+const evUsed  = new Uint8Array(EV_SIZE);
+
+function evalPosition(state, useNN, lo, hi) {
+  const useCache = lo !== undefined;
+  let slot = 0;
+  if (useCache) {
+    slot = lo & EV_MASK;
+    if (evUsed[slot] && evKeyLo[slot] === (lo | 0) && evKeyHi[slot] === (hi | 0)) {
+      return evVal[slot];
+    }
+  }
+
+  const hand = evaluatePosition(state);
+  let val = hand;
   if (useNN && nnIsReady()) {
     const s = nnEvaluate(state.board);
-    if (s !== null) val -= GAMMA_NET * s;
+    if (s !== null) val = (1 - NN_WEIGHT) * hand + NN_WEIGHT * (-s * 100);
+  }
+
+  if (useCache) {
+    evKeyLo[slot] = lo | 0; evKeyHi[slot] = hi | 0;
+    evVal[slot] = val; evUsed[slot] = 1;
   }
   return val;
 }
@@ -167,7 +200,7 @@ function quiescence(state, lo, hi, alpha, beta, side, useNN, qDepth) {
   if (aborted) return 0;
 
   const maximize = side === 'black';
-  const standPat = evalPosition(state, useNN);
+  const standPat = evalPosition(state, useNN, lo, hi);
 
   if (maximize) {
     if (standPat >= beta) return beta;
@@ -215,8 +248,10 @@ let timeLimitMs  = 5000;
 let nodeCount    = 0;
 
 function search(state, lo, hi, depth, alpha, beta, side, ply, useNN, isNullMove) {
-  // Periodic time check (every 2048 nodes to keep overhead low)
-  if ((++nodeCount & 2047) === 0 && Date.now() - startTime >= timeLimitMs) {
+  // Periodic time check. Checked every 512 nodes rather than 2048: a neural
+  // leaf evaluation costs ~50µs, so a coarser interval can overshoot the
+  // budget noticeably before the abort is noticed.
+  if ((++nodeCount & 511) === 0 && Date.now() - startTime >= timeLimitMs) {
     aborted = true;
   }
   if (aborted) return [null, 0];
@@ -395,10 +430,10 @@ export function searchBestMove(state, timeLimit, useNN) {
     // Stop if we've found a forced mate
     if (Math.abs(score) >= MATE_SCORE - 100) break;
 
-    // Time management: don't start the next iteration if we've used ≥ 65% of time,
-    // because deeper iterations typically take 3–5× longer
+    // Time management: don't start the next iteration if we've used ≥ 55% of the
+    // budget, since each deeper iteration typically costs 3–5× the previous one.
     const elapsed = Date.now() - startTime;
-    if (elapsed >= timeLimitMs * 0.65) break;
+    if (elapsed >= timeLimitMs * 0.55) break;
   }
 
   return bestMove;

@@ -3,9 +3,9 @@
 
 import {
   initState, makeMove, getLegalMoves, getGameStatus,
-  isInCheck, PIECE_GLYPHS, opposite, evaluatePosition
+  isInCheck, PIECE_GLYPHS, opposite, evaluatePosition, positionKey
 } from './chess.js';
-import { loadModel, isReady as nnIsReady, evaluate } from './neural.js';
+import { loadModel, isReady as nnIsReady, evaluate, lastError as nnError } from './neural.js';
 import { searchBestMove } from './engine.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -21,6 +21,8 @@ let gameOver      = false;
 let sideToMove    = 'white';
 let aiThinking    = false;
 let boardFlipped  = false; // true when playing as Black (board rotated 180°)
+let posCounts     = new Map(); // position key → occurrences, for threefold repetition
+let gameId        = 0;         // bumped per game so stale search results are ignored
 
 // ── DOM References ─────────────────────────────────────────────────────────
 const boardEl     = document.getElementById('board');
@@ -34,26 +36,63 @@ const nnCb        = document.getElementById('nn-cb');
 const evalFillEl  = document.getElementById('eval-white-fill');
 const evalTextEl  = document.getElementById('eval-text');
 
+// ── Search Worker ──────────────────────────────────────────────────────────
+// The engine runs in a Web Worker so a multi-second search never freezes the
+// board or the spinner. If module workers are unavailable the engine still
+// runs on the main thread — correct, just less smooth.
+let worker      = null;
+let workerReqId = 0;
+const pendingSearches = new Map();
+
+try {
+  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'result') {
+      const resolve = pendingSearches.get(msg.id);
+      if (resolve) { pendingSearches.delete(msg.id); resolve(msg.move); }
+    }
+  };
+  worker.onerror = () => { worker = null; };   // fall back to main thread
+} catch (_) {
+  worker = null;
+}
+
+// Resolves to the chosen move, searching off-thread when possible.
+function findBestMove(state, timeLimit, withNN) {
+  if (worker) {
+    return new Promise(resolve => {
+      const id = ++workerReqId;
+      pendingSearches.set(id, resolve);
+      worker.postMessage({ type: 'search', id, state, timeLimit, useNN: withNN });
+    });
+  }
+  return new Promise(resolve => {
+    setTimeout(() => resolve(searchBestMove(state, timeLimit, withNN)), 20);
+  });
+}
+
 // ── Neural Network Initialization ──────────────────────────────────────────
+// Pure-JS inference (js/neural.js) — no TensorFlow.js, no CDN, works offline.
+// The main thread loads its own copy for the evaluation bar; the worker loads
+// one for the search. The game is fully playable without the model.
 (async function () {
   try {
-    if (typeof tf !== 'undefined') {
-      await loadModel(tf);
-      if (nnIsReady()) {
-        setStatus('Ready (NN loaded)');
-      } else {
-        setStatus('Ready (no NN model)');
-        nnCb.checked = false;
-        useNN = false;
-      }
+    await loadModel();
+    if (nnIsReady()) {
+      nnCb.disabled = false;
+      updateEvalBar();
+      if (!aiThinking && !gameOver) setStatus(`${cap(sideToMove)} to move`);
     } else {
-      setStatus('Ready');
-      nnCb.checked = false;
+      console.warn('Neural net unavailable:', nnError());
+      nnCb.checked  = false;
+      nnCb.disabled = true;
       useNN = false;
     }
-  } catch (_) {
-    setStatus('Ready');
-    nnCb.checked = false;
+  } catch (e) {
+    console.warn('Neural net failed to load:', e);
+    nnCb.checked  = false;
+    nnCb.disabled = true;
     useNN = false;
   }
 })();
@@ -243,6 +282,7 @@ function applyMove(mv, bySide) {
   gameState._sideToMove = opposite(bySide);
   sideToMove = opposite(bySide);
   selectedSq = null; selectedLegal = [];
+  recordPosition();
 
   renderBoard();
   renderCaptured();
@@ -255,31 +295,48 @@ function applyMove(mv, bySide) {
   }
 }
 
+// ── Repetition Tracking ────────────────────────────────────────────────────
+function recordPosition() {
+  const k = positionKey(gameState, sideToMove);
+  posCounts.set(k, (posCounts.get(k) || 0) + 1);
+}
+
+function currentRepCount() {
+  return posCounts.get(positionKey(gameState, sideToMove)) || 1;
+}
+
 // ── AI ─────────────────────────────────────────────────────────────────────
 function requestAIMove() {
   aiThinking = true;
   showThinking();
 
-  // setTimeout lets browser paint the spinner before blocking
-  setTimeout(() => {
-    const snap = JSON.parse(JSON.stringify(gameState));
-    const best = searchBestMove(snap, thinkTimeMs, useNN && nnIsReady());
+  const snap    = JSON.parse(JSON.stringify(gameState));
+  const forSide = aiSide;
+  const forGame = gameId;
+
+  findBestMove(snap, thinkTimeMs, useNN && nnIsReady()).then(best => {
+    // Discard results from a game that has since been restarted.
+    if (forGame !== gameId) return;
+
     aiThinking = false;
     hideThinking();
 
+    if (gameOver || sideToMove !== forSide) return;
+
     if (!best) { setStatus('AI has no legal move!'); return; }
-    applyMove(best, aiSide);
-  }, 20);
+    applyMove(best, forSide);
+  });
 }
 
 // ── Status ─────────────────────────────────────────────────────────────────
 function updateStatus() {
-  const st = getGameStatus(gameState, sideToMove);
+  const st = getGameStatus(gameState, sideToMove, currentRepCount());
   if (st.over) {
     gameOver = true;
     if (st.result === 'white_wins')      setStatus('White wins by checkmate!', 'mate');
     else if (st.result === 'black_wins') setStatus('Black wins by checkmate!', 'mate');
-    else                                 setStatus('Stalemate — draw.', 'draw');
+    else if (st.reason === 'stalemate')  setStatus('Stalemate — draw.', 'draw');
+    else                                 setStatus(`Draw — ${st.reason}.`, 'draw');
     return;
   }
   if (isInCheck(gameState, sideToMove)) {
@@ -362,7 +419,9 @@ document.querySelectorAll('[data-time]').forEach(btn => {
 
 // ── Initialization ─────────────────────────────────────────────────────────
 function startNewGame(chosenHumanSide = humanSide) {
-  if (aiThinking) return;
+  gameId++;            // invalidates any search still running for the old game
+  aiThinking   = false;
+  hideThinking();
   humanSide    = chosenHumanSide;
   aiSide       = opposite(chosenHumanSide);
   boardFlipped = humanSide === 'black'; // rotate board so player's pieces are always at bottom
@@ -372,6 +431,8 @@ function startNewGame(chosenHumanSide = humanSide) {
   gameOver     = false;
   selectedSq   = null;
   selectedLegal = [];
+  posCounts    = new Map();
+  recordPosition();
   legalMoves   = getLegalMoves(gameState, 'white');
   buildBoard();     // rebuild grid with correct orientation
   renderBoard();
