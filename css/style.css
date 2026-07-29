@@ -311,6 +311,30 @@ body {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Footer (version & credit) ── */
+#footer {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: center;
+  font-size: 10px;
+  color: #777;
+  border-top: 1px solid #404040;
+  padding-top: 6px;
+  margin-top: 4px;
+}
+
+#version {
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+#credit {
+  font-size: 9px;
+  opacity: 0.8;
+}
+
 /* ── Landscape override: side-by-side layout ── */
 @media (orientation: landscape) and (max-height: 600px) {
   :root {
