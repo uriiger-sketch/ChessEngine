@@ -610,43 +610,53 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
 }
 
 /**
- * The best `count` moves for the side to move, best first, for hints.
+ * The best `count` moves for the side to move, for hints.
  *
  * Found by exclusion: search, remember the best move, search again with it
- * barred at the root, and so on. Each pass gets an equal share of the time and
- * starts from the table the previous one filled, so the later passes are
- * cheaper than they look. Scores are centipawns from the mover's view.
+ * barred at the root, and so on. The first pass sees every move, so its answer
+ * IS the engine's best move and always stays first. The later passes only
+ * answer "best among the rest", and their order is kept as found: re-sorting
+ * the list by score once let a later pass's move — one the full search had
+ * already weighed and rejected — jump to first place on the strength of a
+ * shallower search's number.
  *
- * @returns {{move: object, score: number, mateIn: number|null}[]}
+ * `bestMs` is the first pass's time; callers give it the same budget the
+ * engine gets for its own move, so the suggestion is exactly as deep as the
+ * move the player is facing. Each later pass gets `opts.restMs`.
+ * `opts.onFound(list)` is called after every pass, so the best move can be
+ * shown before the alternatives are ready. Scores are centipawns from the
+ * mover's view.
+ *
+ * @returns {{move: object, score: number, mateIn: number|null, pass: number, depth: number}[]}
  */
-export function searchTopMoves(state, timeLimit, count, useNN, opts) {
+export function searchTopMoves(state, bestMs, count, useNN, opts = {}) {
   const side = state._sideToMove || state.sideToMove || 'white';
   const uiMoves = getLegalMoves(state, side);
   const want = Math.min(count, uiMoves.length);
   if (want === 0) return [];
 
   loadRoot(state, side, opts);
-  const per = timeLimit / want;
+  const restMs = opts.restMs || Math.max(250, bestMs * 0.25);
   const found = [];
   const excluded = [];
 
   try {
     for (let i = 0; i < want; i++) {
-      beginSearch(per, useNN);
+      const ms = i === 0 ? bestMs : restMs;
+      beginSearch(ms, useNN);
       rootExclude = excluded.length ? excluded : null;
-      const r = iterate(pos, startTime + per * 0.5);
+      const r = iterate(pos, startTime + ms * 0.5);
       if (r.move === NO_MOVE) break;
       const ui = matchUIMove(r.move, uiMoves);
       if (!ui) break;
-      found.push({ move: ui, score: r.score, mateIn: mateIn(r.score) });
+      found.push({ move: ui, score: r.score, mateIn: mateIn(r.score), pass: i, depth: r.depth });
       excluded.push(r.move);
+      if (opts.onFound) opts.onFound(found.slice());
     }
   } finally {
     rootExclude = null;
   }
-  // Passes can finish a ply apart, which occasionally scores the second find
-  // below the third. Ranking by score keeps "1, 2, 3" meaning best to worst.
-  return found.sort((a, b) => b.score - a.score);
+  return found;
 }
 
 function readPV() {

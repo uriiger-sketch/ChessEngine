@@ -100,9 +100,18 @@ function check(name, ok, detail) {
   const chips = () => page.evaluate(() =>
     [...document.querySelectorAll('#hint-panel .hint-chip')].map(c => c.textContent.trim()));
   const waitForHints = async () => {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 80; i++) {
       await sleep(150);
       if ((await chips()).length > 0) return true;
+    }
+    return false;
+  };
+  // Suggestions stream in best-first; this waits for the whole set.
+  const waitForAllHints = async () => {
+    for (let i = 0; i < 120; i++) {
+      await sleep(150);
+      const pending = await page.$('#hint-panel .hint-note');
+      if (!pending && (await chips()).length > 0) return true;
     }
     return false;
   };
@@ -145,7 +154,8 @@ function check(name, ok, detail) {
   await page.click('.mode-btn[data-mode="help"]');
   check('switches to Help mode', (await mode()) === 'help');
   check('hints appear on the player\'s turn', await waitForHints());
-  await sleep(600);    // let the arrows finish fading in
+  check('all three suggestions arrive', await waitForAllHints());
+  await sleep(500);    // let the arrows finish fading in
   const c1 = await chips();
   console.log('  hints: ' + c1.join('   '));
   check('three suggestions listed', c1.length === 3, String(c1.length));

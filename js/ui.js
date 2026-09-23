@@ -52,11 +52,16 @@ let backUsed      = false;
 let history       = [];   // snapshot taken before each move
 
 // ── Help mode state ────────────────────────────────────────────────────────
+// The best-move search gets exactly the engine's own thinking time, so the
+// suggestion is as deep as the move it has to answer. It used to get a fixed
+// 1.5s split three ways — a quarter of what the engine had at the 2s setting —
+// which is why following the hints lost: that was the engine playing itself
+// with a quarter of the time. The two alternatives get a quarter each.
 const HINT_COUNT   = 3;
-const HINT_TIME_MS = 1500;
 let hints          = [];      // [{move, score, mateIn}] best first
 let hintsPending   = false;
 let hintReqId      = 0;
+let hintsDrawn     = 0;       // how many of `hints` are already on screen
 
 // ── DOM References ─────────────────────────────────────────────────────────
 const boardEl      = document.getElementById('board');
@@ -116,7 +121,7 @@ function getHintWorker() {
     hintWorker = makeWorker();
     hintWorker.onmessage = (e) => {
       const msg = e.data;
-      if (msg.type === 'hints') receiveHints(msg.id, msg.hints || []);
+      if (msg.type === 'hints') receiveHints(msg.id, msg.hints || [], msg.done !== false);
     };
     hintWorker.onerror = () => { hintWorker = null; };
   } catch (_) {
@@ -487,7 +492,8 @@ function requestHints() {
   const payload = {
     type: 'hints', id,
     state: JSON.parse(JSON.stringify(gameState)),
-    timeLimit: HINT_TIME_MS,
+    bestMs: thinkTimeMs,
+    restMs: Math.max(300, thinkTimeMs * 0.25),
     count: HINT_COUNT,
     useNN: nnIsReady(),
     history: zobristKeys.slice(),
@@ -501,16 +507,18 @@ function requestHints() {
     // hints still arrive.
     setTimeout(() => {
       if (id !== hintReqId) return;
-      const found = searchTopMoves(payload.state, payload.timeLimit, payload.count,
-                                   payload.useNN, { history: payload.history });
-      receiveHints(id, found);
+      const found = searchTopMoves(payload.state, payload.bestMs, payload.count, payload.useNN,
+                                   { history: payload.history, restMs: payload.restMs });
+      receiveHints(id, found, true);
     }, 30);
   }
 }
 
-function receiveHints(id, found) {
+// Suggestions arrive one at a time, best first. Each arrival only adds to what
+// is on screen, so the ones already shown do not flicker or re-animate.
+function receiveHints(id, found, done) {
   if (id !== hintReqId || !hintsWanted()) return;   // the position has moved on
-  hintsPending = false;
+  hintsPending = !done;
   hints = found;
   renderHintPanel();
   renderHintLayer();
@@ -524,8 +532,9 @@ function clearHints() {
   if (hintsPending && hintWorker) { hintWorker.terminate(); hintWorker = null; }
   hintsPending = false;
   hints = [];
-  renderHintPanel();
-  renderHintLayer();
+  hintsDrawn = 0;
+  hintPanel.innerHTML = '';
+  while (hintLayer.firstChild) hintLayer.removeChild(hintLayer.firstChild);
 }
 
 function formatScore(h) {
@@ -537,17 +546,14 @@ function formatScore(h) {
 }
 
 function renderHintPanel() {
-  if (hintsPending) {
-    hintPanel.innerHTML = '<span class="hint-note">Finding your best moves<span class="dots"></span></span>';
-    return;
-  }
-  if (!hints.length) { hintPanel.innerHTML = ''; return; }
+  // Chips for suggestions not yet shown are appended; existing ones stay put.
+  const have = hintPanel.querySelectorAll('.hint-chip').length;
+  hintPanel.querySelector('.hint-note')?.remove();
 
-  hintPanel.innerHTML = '';
-  hints.forEach((h, i) => {
+  for (let i = have; i < hints.length; i++) {
+    const h = hints[i];
     const chip = document.createElement('button');
     chip.className = `hint-chip r${i + 1}`;
-    chip.style.animationDelay = `${i * 70}ms`;
     chip.title = 'Tap to pick up this piece';
     chip.innerHTML =
       `<span class="num">${i + 1}</span>` +
@@ -559,7 +565,16 @@ function renderHintPanel() {
       selectSquare(h.move.from[0], h.move.from[1]);
     });
     hintPanel.appendChild(chip);
-  });
+  }
+
+  if (hintsPending) {
+    const note = document.createElement('span');
+    note.className = 'hint-note';
+    note.innerHTML = hints.length
+      ? '<span class="dots"></span>'
+      : 'Finding your best move<span class="dots"></span>';
+    hintPanel.appendChild(note);
+  }
 }
 
 // Arrows over the board, numbered and coloured to match the chips.
@@ -568,8 +583,6 @@ const HINT_COLORS = ['var(--hint-1)', 'var(--hint-2)', 'var(--hint-3)'];
 const HINT_WIDTH  = [17, 14, 12];
 
 function renderHintLayer() {
-  while (hintLayer.firstChild) hintLayer.removeChild(hintLayer.firstChild);
-  if (!hints.length) return;
 
   const centre = (r, c) => {
     const vr = boardFlipped ? 7 - r : r;
@@ -577,8 +590,9 @@ function renderHintLayer() {
     return [vc * 100 + 50, vr * 100 + 50];
   };
 
-  // Drawn worst-first so the best suggestion sits on top where arrows cross.
-  for (let i = hints.length - 1; i >= 0; i--) {
+  // Only suggestions not yet drawn. Each new one is inserted beneath those
+  // already there, so the best suggestion stays on top where arrows cross.
+  for (let i = hintsDrawn; i < hints.length; i++) {
     const mv = hints[i].move;
     const [x1, y1] = centre(mv.from[0], mv.from[1]);
     const [x2, y2] = centre(mv.to[0], mv.to[1]);
@@ -587,7 +601,6 @@ function renderHintLayer() {
 
     const g = document.createElementNS(SVG_NS, 'g');
     g.setAttribute('class', 'hint-arrow');
-    g.style.animationDelay = `${i * 70}ms`;
 
     // Mark the destination with a ring in the hint's colour. A flat tint was
     // tried first and mixed into muddy grey on the light squares.
@@ -648,8 +661,9 @@ function renderHintLayer() {
     num.textContent = String(i + 1);
     g.appendChild(num);
 
-    hintLayer.appendChild(g);
+    hintLayer.insertBefore(g, hintLayer.firstChild);
   }
+  hintsDrawn = hints.length;
 }
 
 // Standard algebraic notation with piece glyphs, e.g. "♘f3", "exd5", "O-O".

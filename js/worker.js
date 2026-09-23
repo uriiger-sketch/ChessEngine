@@ -25,12 +25,17 @@ self.onmessage = (e) => {
   // worker so a hint search can never delay the engine's own move.
   if (msg.type === 'hints') {
     try {
-      const hints = searchTopMoves(msg.state, msg.timeLimit, msg.count, msg.useNN && nnIsReady(), {
+      // Each suggestion is posted as soon as its search finishes, so the best
+      // move appears without waiting for the alternatives.
+      const hints = searchTopMoves(msg.state, msg.bestMs, msg.count, msg.useNN && nnIsReady(), {
         history: msg.history,
+        restMs: msg.restMs,
+        onFound: list => self.postMessage({ type: 'hints', id: msg.id, hints: list, done: false }),
       });
-      self.postMessage({ type: 'hints', id: msg.id, hints });
+      self.postMessage({ type: 'hints', id: msg.id, hints, done: true });
     } catch (err) {
-      self.postMessage({ type: 'hints', id: msg.id, hints: [], error: String((err && err.message) || err) });
+      self.postMessage({ type: 'hints', id: msg.id, hints: [], done: true,
+                         error: String((err && err.message) || err) });
     }
     return;
   }
