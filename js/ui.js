@@ -6,7 +6,7 @@ import {
   isInCheck, PIECE_GLYPHS, opposite, positionKey
 } from './chess.js';
 import { loadModel, isReady as nnIsReady, lastError as nnError } from './neural.js';
-import { searchBestMove, resetEngine, zobristOf, staticEvalOf } from './engine.js';
+import { searchBestMove, searchTopMoves, resetEngine, zobristOf, staticEvalOf } from './engine.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let gameState     = null;
@@ -16,7 +16,6 @@ let legalMoves    = [];
 let selectedSq    = null;
 let selectedLegal = [];
 let thinkTimeMs   = 5000;
-let useNN         = false;   // off by default — see the note in js/engine.js
 let gameOver      = false;
 let sideToMove    = 'white';
 let aiThinking    = false;
@@ -34,39 +33,70 @@ let zobristKeys   = [];
 // evaluation bar prefers it while it is current.
 let searchedEval  = null;
 
-// ── Learning mode ──────────────────────────────────────────────────────────
-// With learning mode on the player gets one take-back at a time: the button
-// rewinds their last move together with the AI's reply, and then stays disabled
-// until they have played again. That makes it a way to explore an alternative
-// after seeing the refutation, rather than a way to rewind the whole game.
-let learningMode  = false;
-let takebackUsed  = false;
+// ── Modes ──────────────────────────────────────────────────────────────────
+//   play   just the game
+//   learn  adds Back: return to the start of your last turn and play again
+//   help   Back as well, plus the engine's three best moves on your turn
+//
+// Modes can be switched at any point in a game; nothing restarts. Back is
+// limited to once per move — after using it you must play before using it
+// again — so it is a way to try an alternative, not to rewind the game.
+const MODES = ['play', 'learn', 'help'];
+const MODE_CAPTIONS = {
+  play:  'Just you and the engine.',
+  learn: 'Back returns you to the start of your last turn.',
+  help:  'Your three best moves are shown each turn. Back is available too.',
+};
+let mode          = loadMode();
+let backUsed      = false;
 let history       = [];   // snapshot taken before each move
 
-// ── DOM References ─────────────────────────────────────────────────────────
-const boardEl     = document.getElementById('board');
-const statusEl    = document.getElementById('status');
-const capturedEl  = document.getElementById('captured-wrap');
-const promoModal  = document.getElementById('promo-modal');
-const promoChoices = document.getElementById('promo-choices');
-const thinkingEl  = document.getElementById('thinking-overlay');
-const newGameBtn  = document.getElementById('new-game-btn');
-const takebackBtn = document.getElementById('takeback-btn');
-const nnCb        = document.getElementById('nn-cb');
-const learnCb     = document.getElementById('learn-cb');
-const evalFillEl  = document.getElementById('eval-white-fill');
-const evalTextEl  = document.getElementById('eval-text');
+// ── Help mode state ────────────────────────────────────────────────────────
+const HINT_COUNT   = 3;
+const HINT_TIME_MS = 1500;
+let hints          = [];      // [{move, score, mateIn}] best first
+let hintsPending   = false;
+let hintReqId      = 0;
 
-// ── Search Worker ──────────────────────────────────────────────────────────
+// ── DOM References ─────────────────────────────────────────────────────────
+const boardEl      = document.getElementById('board');
+const hintLayer    = document.getElementById('hint-layer');
+const hintPanel    = document.getElementById('hint-panel');
+const statusEl     = document.getElementById('status');
+const capturedEl   = document.getElementById('captured-wrap');
+const promoModal   = document.getElementById('promo-modal');
+const promoChoices = document.getElementById('promo-choices');
+const thinkingEl   = document.getElementById('thinking-overlay');
+const newGameBtn   = document.getElementById('new-game-btn');
+const backBtn      = document.getElementById('back-btn');
+const modeSwitch   = document.getElementById('mode-switch');
+const modeCaption  = document.getElementById('mode-caption');
+const evalFillEl   = document.getElementById('eval-white-fill');
+const evalTextEl   = document.getElementById('eval-text');
+const confirmModal = document.getElementById('confirm-modal');
+const confirmTitle = document.getElementById('confirm-title');
+const confirmSub   = document.getElementById('confirm-sub');
+const confirmYes   = document.getElementById('confirm-yes');
+const confirmNo    = document.getElementById('confirm-no');
+
+// ── Search Workers ─────────────────────────────────────────────────────────
 // The engine runs in a Web Worker so a multi-second search never freezes the
 // board or the spinner. If module workers are unavailable the engine still
 // runs on the main thread — correct, just less smooth.
+//
+// Help mode gets a second worker of its own. Sharing one would queue the
+// engine's reply behind a hint search still in progress; with two, a hint
+// search that has gone stale is simply terminated.
 let worker      = null;
 let workerReqId = 0;
 const pendingSearches = new Map();
 
+function makeWorker() {
+  return new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+}
+
 try {
-  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  worker = makeWorker();
   worker.onmessage = (e) => {
     const msg = e.data;
     if (msg.type === 'result') {
@@ -79,8 +109,25 @@ try {
   worker = null;
 }
 
+let hintWorker = null;
+function getHintWorker() {
+  if (hintWorker || !worker) return hintWorker;
+  try {
+    hintWorker = makeWorker();
+    hintWorker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === 'hints') receiveHints(msg.id, msg.hints || []);
+    };
+    hintWorker.onerror = () => { hintWorker = null; };
+  } catch (_) {
+    hintWorker = null;
+  }
+  return hintWorker;
+}
+
 // Resolves to {move, info}, searching off-thread when possible.
-function findBestMove(state, timeLimit, withNN, historyKeys) {
+function findBestMove(state, timeLimit, historyKeys) {
+  const withNN = nnIsReady();
   if (worker) {
     return new Promise(resolve => {
       const id = ++workerReqId;
@@ -105,29 +152,20 @@ function resetSearchState() {
 
 // ── Neural Network Initialization ──────────────────────────────────────────
 // Pure-JS inference (js/neural.js) — no TensorFlow.js, no CDN, works offline.
-// The main thread loads its own copy for the evaluation bar; the worker loads
-// one for the search. The game is fully playable without the model.
+// The network is always used once loaded; the main thread loads its own copy
+// for the evaluation bar and each worker loads one for its searches. The game
+// is still fully playable if the model cannot be loaded.
 (async function () {
   try {
     await loadModel();
     if (nnIsReady()) {
-      // Available to switch on, but left off: it measured weaker than the hand
-      // evaluation, so the default is the engine's strongest setting.
-      nnCb.disabled = false;
-      useNN = nnCb.checked;
       updateEvalBar();
-      if (!aiThinking && !gameOver) setStatus(`${cap(sideToMove)} to move`);
+      if (!aiThinking && !gameOver) updateStatus();
     } else {
       console.warn('Neural net unavailable:', nnError());
-      nnCb.checked  = false;
-      nnCb.disabled = true;
-      useNN = false;
     }
   } catch (e) {
     console.warn('Neural net failed to load:', e);
-    nnCb.checked  = false;
-    nnCb.disabled = true;
-    useNN = false;
   }
 })();
 
@@ -244,7 +282,7 @@ function updateEvalBar() {
     try {
       // Otherwise the engine's own leaf evaluation, so the bar and the engine
       // never disagree about what the position is worth.
-      whiteAdv = staticEvalOf(gameState, sideToMove, useNN && nnIsReady()) / 100;
+      whiteAdv = staticEvalOf(gameState, sideToMove, nnIsReady()) / 100;
     } catch (_) {}
   }
 
@@ -279,15 +317,19 @@ function onBoardTap(e) {
   handleSquareTap(+sqEl.dataset.r, +sqEl.dataset.c);
 }
 
+function selectSquare(r, c) {
+  selectedSq = [r, c];
+  selectedLegal = legalMoves.filter(mv => mv.from[0] === r && mv.from[1] === c);
+  renderBoard();
+}
+
 function handleSquareTap(r, c) {
   const piece = gameState.board[r][c];
   const friendSign = humanSide === 'white' ? 1 : -1;
 
   if (!selectedSq) {
     if (Math.sign(piece) !== friendSign) return;
-    selectedSq = [r, c];
-    selectedLegal = legalMoves.filter(mv => mv.from[0] === r && mv.from[1] === c);
-    renderBoard();
+    selectSquare(r, c);
     return;
   }
 
@@ -309,16 +351,16 @@ function handleSquareTap(r, c) {
   }
 
   if (Math.sign(piece) === friendSign) {
-    selectedSq = [r, c];
-    selectedLegal = legalMoves.filter(mv => mv.from[0] === r && mv.from[1] === c);
+    selectSquare(r, c);
   } else {
     selectedSq = null; selectedLegal = [];
+    renderBoard();
   }
-  renderBoard();
 }
 
 // ── Move Application ───────────────────────────────────────────────────────
 function applyMove(mv, bySide) {
+  if (bySide === humanSide) clearHints();
   history.push(snapshot());
 
   gameState = makeMove(gameState, mv);
@@ -327,9 +369,9 @@ function applyMove(mv, bySide) {
   selectedSq = null; selectedLegal = [];
   recordPosition();
 
-  // The player has committed to a move, so the take-back is available again.
+  // The player has committed to a move, so Back is available again.
   if (bySide === humanSide) {
-    takebackUsed = false;
+    backUsed = false;
     searchedEval = null;
   }
 
@@ -337,11 +379,12 @@ function applyMove(mv, bySide) {
   renderCaptured();
   updateStatus();
   updateEvalBar();
-  updateTakebackBtn();
+  updateBackBtn();
 
   if (!gameOver) {
     legalMoves = getLegalMoves(gameState, sideToMove);
     if (sideToMove === aiSide) requestAIMove();
+    else requestHints();
   }
 }
 
@@ -357,7 +400,7 @@ function currentRepCount() {
   return posCounts.get(positionKey(gameState, sideToMove)) || 1;
 }
 
-// ── History / Take Back ────────────────────────────────────────────────────
+// ── History / Back ─────────────────────────────────────────────────────────
 function snapshot() {
   return {
     state: JSON.parse(JSON.stringify(gameState)),
@@ -390,12 +433,14 @@ function lastHumanTurnIndex() {
   return -1;
 }
 
-function canTakeBack() {
-  return learningMode && !takebackUsed && lastHumanTurnIndex() >= 0;
+function canGoBack() {
+  return mode !== 'play' && !backUsed && lastHumanTurnIndex() >= 0;
 }
 
-function takeBack() {
-  if (!canTakeBack()) return;
+// Return to the start of the player's last turn — undoing their move and the
+// engine's reply if it has come — so they can play something else.
+function goBack() {
+  if (!canGoBack()) return;
   const idx = lastHumanTurnIndex();
 
   // Invalidate any search still running: its answer is for a position that is
@@ -403,22 +448,250 @@ function takeBack() {
   gameId++;
   aiThinking = false;
   hideThinking();
+  clearHints();
 
   const snap = history[idx];
   history.length = idx;
   restore(snap);
-  takebackUsed = true;
+  backUsed = true;
 
   renderBoard();
   renderCaptured();
   updateStatus();
+  if (!gameOver && statusEl.className === '') {
+    setStatus(`${cap(sideToMove)} to move — try another move`);
+  }
   updateEvalBar();
-  updateTakebackBtn();
+  updateBackBtn();
+  requestHints();
 }
 
-function updateTakebackBtn() {
-  takebackBtn.disabled = !canTakeBack();
-  takebackBtn.textContent = learningMode && takebackUsed ? 'Take Back ✓' : 'Take Back';
+function updateBackBtn() {
+  backBtn.disabled = !canGoBack();
+}
+
+// ── Help mode: the player's best moves ─────────────────────────────────────
+function hintsWanted() {
+  return mode === 'help' && gameState !== null && !gameOver && !aiThinking &&
+         sideToMove === humanSide;
+}
+
+function requestHints() {
+  clearHints();
+  if (!hintsWanted()) return;
+
+  const id = ++hintReqId;
+  hintsPending = true;
+  renderHintPanel();
+
+  const payload = {
+    type: 'hints', id,
+    state: JSON.parse(JSON.stringify(gameState)),
+    timeLimit: HINT_TIME_MS,
+    count: HINT_COUNT,
+    useNN: nnIsReady(),
+    history: zobristKeys.slice(),
+  };
+
+  const hw = getHintWorker();
+  if (hw) {
+    hw.postMessage(payload);
+  } else {
+    // No workers: search here. The board is briefly unresponsive, but the
+    // hints still arrive.
+    setTimeout(() => {
+      if (id !== hintReqId) return;
+      const found = searchTopMoves(payload.state, payload.timeLimit, payload.count,
+                                   payload.useNN, { history: payload.history });
+      receiveHints(id, found);
+    }, 30);
+  }
+}
+
+function receiveHints(id, found) {
+  if (id !== hintReqId || !hintsWanted()) return;   // the position has moved on
+  hintsPending = false;
+  hints = found;
+  renderHintPanel();
+  renderHintLayer();
+}
+
+// Drop the current suggestions. A hint search still running is for a position
+// that no longer matters, so its worker is terminated rather than left to
+// compete with the engine for the CPU; the next request starts a fresh one.
+function clearHints() {
+  hintReqId++;
+  if (hintsPending && hintWorker) { hintWorker.terminate(); hintWorker = null; }
+  hintsPending = false;
+  hints = [];
+  renderHintPanel();
+  renderHintLayer();
+}
+
+function formatScore(h) {
+  if (h.mateIn !== null && h.mateIn !== undefined) {
+    return h.mateIn > 0 ? `mate in ${h.mateIn}` : `mated in ${-h.mateIn}`;
+  }
+  const p = h.score / 100;
+  return (p >= 0 ? '+' : '−') + Math.abs(p).toFixed(1);
+}
+
+function renderHintPanel() {
+  if (hintsPending) {
+    hintPanel.innerHTML = '<span class="hint-note">Finding your best moves<span class="dots"></span></span>';
+    return;
+  }
+  if (!hints.length) { hintPanel.innerHTML = ''; return; }
+
+  hintPanel.innerHTML = '';
+  hints.forEach((h, i) => {
+    const chip = document.createElement('button');
+    chip.className = `hint-chip r${i + 1}`;
+    chip.style.animationDelay = `${i * 70}ms`;
+    chip.title = 'Tap to pick up this piece';
+    chip.innerHTML =
+      `<span class="num">${i + 1}</span>` +
+      `<span class="san">${toSAN(gameState, sideToMove, h.move)}</span>` +
+      `<span class="score">${formatScore(h)}</span>`;
+    // Tapping a suggestion picks the piece up, so one more tap plays it.
+    bindTap(chip, () => {
+      if (!hintsWanted()) return;
+      selectSquare(h.move.from[0], h.move.from[1]);
+    });
+    hintPanel.appendChild(chip);
+  });
+}
+
+// Arrows over the board, numbered and coloured to match the chips.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const HINT_COLORS = ['var(--hint-1)', 'var(--hint-2)', 'var(--hint-3)'];
+const HINT_WIDTH  = [17, 14, 12];
+
+function renderHintLayer() {
+  while (hintLayer.firstChild) hintLayer.removeChild(hintLayer.firstChild);
+  if (!hints.length) return;
+
+  const centre = (r, c) => {
+    const vr = boardFlipped ? 7 - r : r;
+    const vc = boardFlipped ? 7 - c : c;
+    return [vc * 100 + 50, vr * 100 + 50];
+  };
+
+  // Drawn worst-first so the best suggestion sits on top where arrows cross.
+  for (let i = hints.length - 1; i >= 0; i--) {
+    const mv = hints[i].move;
+    const [x1, y1] = centre(mv.from[0], mv.from[1]);
+    const [x2, y2] = centre(mv.to[0], mv.to[1]);
+    const color = HINT_COLORS[i];
+    const w = HINT_WIDTH[i];
+
+    const g = document.createElementNS(SVG_NS, 'g');
+    g.setAttribute('class', 'hint-arrow');
+    g.style.animationDelay = `${i * 70}ms`;
+
+    // Mark the destination with a ring in the hint's colour. A flat tint was
+    // tried first and mixed into muddy grey on the light squares.
+    const vr = boardFlipped ? 7 - mv.to[0] : mv.to[0];
+    const vc = boardFlipped ? 7 - mv.to[1] : mv.to[1];
+    const ring = document.createElementNS(SVG_NS, 'rect');
+    ring.setAttribute('x', vc * 100 + 4); ring.setAttribute('y', vr * 100 + 4);
+    ring.setAttribute('width', 92); ring.setAttribute('height', 92);
+    ring.setAttribute('rx', 10);
+    ring.setAttribute('fill', color);
+    ring.setAttribute('fill-opacity', '0.14');
+    ring.setAttribute('stroke', color);
+    ring.setAttribute('stroke-width', 7);
+    g.appendChild(ring);
+
+    // Shaft, stopping short of the square's centre to leave room for the head.
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    const ux = dx / len, uy = dy / len;
+    const head = 34, half = w * 1.35;
+    const sx = x1 + ux * 30, sy = y1 + uy * 30;
+    const bx = x2 - ux * head, by = y2 - uy * head;
+
+    const shaft = document.createElementNS(SVG_NS, 'line');
+    shaft.setAttribute('x1', sx); shaft.setAttribute('y1', sy);
+    shaft.setAttribute('x2', bx); shaft.setAttribute('y2', by);
+    shaft.setAttribute('stroke', color);
+    shaft.setAttribute('stroke-width', w);
+    shaft.setAttribute('stroke-linecap', 'round');
+    shaft.setAttribute('opacity', '0.88');
+    g.appendChild(shaft);
+
+    const px = -uy, py = ux;   // perpendicular
+    const tip = document.createElementNS(SVG_NS, 'polygon');
+    tip.setAttribute('points',
+      `${x2},${y2} ${bx + px * half},${by + py * half} ${bx - px * half},${by - py * half}`);
+    tip.setAttribute('fill', color);
+    tip.setAttribute('opacity', '0.92');
+    g.appendChild(tip);
+
+    // Numbered badge in the corner of the destination square.
+    const bxc = vc * 100 + 20, byc = vr * 100 + 20;
+    const badge = document.createElementNS(SVG_NS, 'circle');
+    badge.setAttribute('cx', bxc); badge.setAttribute('cy', byc);
+    badge.setAttribute('r', 15);
+    badge.setAttribute('fill', color);
+    badge.setAttribute('stroke', '#1a1a1a');
+    badge.setAttribute('stroke-width', 2.5);
+    g.appendChild(badge);
+
+    const num = document.createElementNS(SVG_NS, 'text');
+    num.setAttribute('x', bxc); num.setAttribute('y', byc + 6);
+    num.setAttribute('text-anchor', 'middle');
+    num.setAttribute('font-size', '18');
+    num.setAttribute('font-weight', '800');
+    num.setAttribute('fill', '#111');
+    num.setAttribute('font-family', '-apple-system, BlinkMacSystemFont, sans-serif');
+    num.textContent = String(i + 1);
+    g.appendChild(num);
+
+    hintLayer.appendChild(g);
+  }
+}
+
+// Standard algebraic notation with piece glyphs, e.g. "♘f3", "exd5", "O-O".
+function toSAN(state, side, mv) {
+  if (mv.castle) return mv.castle === 'K' ? 'O-O' : 'O-O-O';
+
+  const file = c => String.fromCharCode(97 + c);
+  const sq = (r, c) => file(c) + (8 - r);
+  const [fr, fc] = mv.from, [tr, tc] = mv.to;
+  const moving = state.board[fr][fc];
+  const pt = Math.abs(moving);
+  const capture = mv.captured !== 0 || mv.enPassant;
+
+  let san = '';
+  if (pt === 1) {
+    if (capture) san += file(fc) + 'x';
+    san += sq(tr, tc);
+    if (mv.promotion) san += '=' + PIECE_GLYPHS[Math.abs(mv.piece)];
+  } else {
+    san += PIECE_GLYPHS[pt];
+    // Disambiguate when another piece of the same kind can reach the square.
+    const rivals = getLegalMoves(state, side).filter(o =>
+      Math.abs(state.board[o.from[0]][o.from[1]]) === pt &&
+      o.to[0] === tr && o.to[1] === tc &&
+      (o.from[0] !== fr || o.from[1] !== fc));
+    if (rivals.length) {
+      const sameFile = rivals.some(o => o.from[1] === fc);
+      const sameRank = rivals.some(o => o.from[0] === fr);
+      if (!sameFile) san += file(fc);
+      else if (!sameRank) san += String(8 - fr);
+      else san += sq(fr, fc);
+    }
+    if (capture) san += 'x';
+    san += sq(tr, tc);
+  }
+
+  const after = makeMove(state, mv);
+  const them = opposite(side);
+  if (isInCheck(after, them)) {
+    san += getLegalMoves(after, them).length === 0 ? '#' : '+';
+  }
+  return san;
 }
 
 // ── AI ─────────────────────────────────────────────────────────────────────
@@ -431,7 +704,7 @@ function requestAIMove() {
   const forSide = aiSide;
   const forGame = gameId;
 
-  findBestMove(snap, thinkTimeMs, useNN && nnIsReady(), keys).then(res => {
+  findBestMove(snap, thinkTimeMs, keys).then(res => {
     // Discard results from a game or position that has since moved on.
     if (forGame !== gameId) return;
 
@@ -509,15 +782,29 @@ function showPromoDialog(candidates, callback) {
   promoModal.removeAttribute('hidden');
 }
 
+// ── Confirmation dialog ────────────────────────────────────────────────────
+// Resolves true for Yes, false for No, a tap outside the card, or Escape.
+let confirmResolve = null;
+
+function confirmDialog(title, sub) {
+  if (confirmResolve) confirmResolve(false);   // never stack two dialogs
+  confirmTitle.textContent = title;
+  confirmSub.textContent = sub;
+  confirmModal.removeAttribute('hidden');
+  return new Promise(resolve => { confirmResolve = resolve; });
+}
+
+function closeConfirm(answer) {
+  if (!confirmResolve) return;
+  confirmModal.setAttribute('hidden', '');
+  const r = confirmResolve;
+  confirmResolve = null;
+  r(answer);
+}
+
 // ── Controls ───────────────────────────────────────────────────────────────
 const playWhiteBtn = document.getElementById('play-white-btn');
 const playBlackBtn = document.getElementById('play-black-btn');
-
-function selectColor(side) {
-  playWhiteBtn.classList.toggle('active', side === 'white');
-  playBlackBtn.classList.toggle('active', side === 'black');
-  startNewGame(side);
-}
 
 // Taps are bound for both mouse and touch; touchstart is intercepted so iOS
 // does not wait for its click delay.
@@ -526,21 +813,33 @@ function bindTap(el, fn) {
   el.addEventListener('touchstart', e => { e.preventDefault(); fn(); }, { passive: false });
 }
 
-bindTap(playWhiteBtn, () => selectColor('white'));
-bindTap(playBlackBtn, () => selectColor('black'));
-bindTap(newGameBtn,   () => startNewGame(humanSide));
-bindTap(takebackBtn,  () => takeBack());
+// A game with moves on the board and no result yet is worth asking about.
+function gameInProgress() {
+  return history.length > 0 && !gameOver;
+}
 
-nnCb.addEventListener('change', () => {
-  useNN = nnCb.checked;
-  searchedEval = null;
-  updateEvalBar();
-});
+async function requestNewGame(side) {
+  if (gameInProgress()) {
+    const title = side === humanSide ? 'Start a new game?' : `Start a new game as ${cap(side)}?`;
+    if (!(await confirmDialog(title, 'The current game will be lost.'))) return;
+  }
+  playWhiteBtn.classList.toggle('active', side === 'white');
+  playBlackBtn.classList.toggle('active', side === 'black');
+  startNewGame(side);
+}
 
-learnCb.addEventListener('change', () => {
-  learningMode = learnCb.checked;
-  learnCb.parentElement.classList.toggle('on', learningMode);
-  updateTakebackBtn();
+bindTap(playWhiteBtn, () => requestNewGame('white'));
+bindTap(playBlackBtn, () => requestNewGame('black'));
+bindTap(newGameBtn,   () => requestNewGame(humanSide));
+bindTap(backBtn,      () => goBack());
+
+bindTap(confirmYes, () => closeConfirm(true));
+bindTap(confirmNo,  () => closeConfirm(false));
+confirmModal.addEventListener('click', e => { if (e.target === confirmModal) closeConfirm(false); });
+document.addEventListener('keydown', e => {
+  if (!confirmResolve) return;
+  if (e.key === 'Escape') closeConfirm(false);
+  if (e.key === 'Enter')  closeConfirm(true);
 });
 
 document.querySelectorAll('[data-time]').forEach(btn => {
@@ -551,11 +850,52 @@ document.querySelectorAll('[data-time]').forEach(btn => {
   });
 });
 
+// ── Mode switching ─────────────────────────────────────────────────────────
+function loadMode() {
+  try {
+    const m = localStorage.getItem('chessnn.mode');
+    if (MODES.includes(m)) return m;
+  } catch (_) { /* storage unavailable — fall back to the default */ }
+  return 'play';
+}
+
+function setMode(next) {
+  if (!MODES.includes(next)) return;
+  const changed = next !== mode;
+  mode = next;
+  try { localStorage.setItem('chessnn.mode', mode); } catch (_) {}
+
+  modeSwitch.dataset.mode = mode;
+  modeSwitch.querySelectorAll('.mode-btn').forEach(b =>
+    b.setAttribute('aria-checked', String(b.dataset.mode === mode)));
+  document.body.classList.toggle('mode-help', mode === 'help');
+
+  // Cross-fade the caption rather than snapping it.
+  if (changed) {
+    modeCaption.classList.add('swap');
+    setTimeout(() => {
+      modeCaption.textContent = MODE_CAPTIONS[mode];
+      modeCaption.classList.remove('swap');
+    }, 150);
+  } else {
+    modeCaption.textContent = MODE_CAPTIONS[mode];
+  }
+
+  updateBackBtn();
+  if (mode === 'help') { if (!hints.length && !hintsPending) requestHints(); }
+  else clearHints();
+}
+
+modeSwitch.querySelectorAll('.mode-btn').forEach(btn => {
+  bindTap(btn, () => setMode(btn.dataset.mode));
+});
+
 // ── Initialization ─────────────────────────────────────────────────────────
 function startNewGame(chosenHumanSide = humanSide) {
   gameId++;            // invalidates any search still running for the old game
   aiThinking   = false;
   hideThinking();
+  clearHints();
   resetSearchState();  // no knowledge carries over between games
   humanSide    = chosenHumanSide;
   aiSide       = opposite(chosenHumanSide);
@@ -569,7 +909,7 @@ function startNewGame(chosenHumanSide = humanSide) {
   posCounts    = new Map();
   zobristKeys  = [];
   history      = [];
-  takebackUsed = false;
+  backUsed     = false;
   searchedEval = null;
   recordPosition();
   legalMoves   = getLegalMoves(gameState, 'white');
@@ -577,10 +917,12 @@ function startNewGame(chosenHumanSide = humanSide) {
   renderBoard();
   renderCaptured();
   updateEvalBar();
-  updateTakebackBtn();
+  updateBackBtn();
   setStatus('White to move');
   if (aiSide === 'white') requestAIMove(); // AI goes first when playing as Black
+  else requestHints();
 }
 
 buildBoard();
+setMode(mode);
 startNewGame();

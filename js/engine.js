@@ -64,9 +64,11 @@ const INF         = 32767;
 // roughly halves the node rate, so it has to earn its keep before it breaks
 // even, which it does not.
 //
-// Hence: the toggle ships OFF, the engine's default is its strongest setting,
-// and the constants below are the best configuration measured for anyone who
-// turns it on. NN_SPLIT_EVAL keeps the correction out of the pruning margins
+// The network is nonetheless always on: that is a product decision, taken
+// with these numbers in view, to keep the engine one that learned from the
+// masters. The constants below are the least costly configuration measured,
+// and at them the engine still beats its predecessor decisively (see
+// test/match.js). NN_SPLIT_EVAL keeps the correction out of the pruning margins
 // (reverse futility, razoring, null move), which are tuned to the hand
 // evaluation's scale and were the single most damaging place to inject noise —
 // worth about 130 Elo on its own at gain 1.0.
@@ -116,8 +118,8 @@ const evVal = new Int32Array(EV_SIZE);
 const evOk  = new Uint8Array(EV_SIZE);
 
 // Cached scores are only valid for the network setting they were computed
-// under, and the setting changes whenever the player flips the toggle. Rather
-// than widen the key, drop the cache when it changes — which is rare.
+// under. The app always runs with it on, but the test harnesses switch it, so
+// rather than widen the key the cache is dropped when the setting changes.
 let evCachedWithNN = null;
 function evalCacheFor(useNN) {
   if (evCachedWithNN !== useNN) { evOk.fill(0); evCachedWithNN = useNN; }
@@ -398,6 +400,7 @@ function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
 
   for (let i = 0; i < n; i++) {
     const m = pickMove(p, n, i);
+    if (ply === 0 && rootExclude !== null && rootExclude.includes(m)) continue;
     const quiet = mvIsQuiet(m);
 
     // Skip obviously losing captures in shallow, non-PV nodes.
@@ -467,7 +470,10 @@ function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
   if (moveCount === 0) return inCheck ? -MATE + ply : 0;   // mate or stalemate
 
   // Store, preferring deeper entries but always replacing stale generations.
-  if (!aborted && (ttFlag[slot] === 0 || ttAge[slot] !== ttGen || ttDepth[slot] <= depth)) {
+  // A root searched with moves excluded has a score for a restricted move list,
+  // which is not the position's value, so it is kept out of the table.
+  const restricted = ply === 0 && rootExclude !== null;
+  if (!aborted && !restricted && (ttFlag[slot] === 0 || ttAge[slot] !== ttGen || ttDepth[slot] <= depth)) {
     let s = bestScore;
     if (s > MATE_BOUND) s += ply;
     else if (s < -MATE_BOUND) s -= ply;
@@ -485,67 +491,45 @@ function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
 // ── Iterative deepening ────────────────────────────────────────────────────
 export const searchInfo = { depth: 0, seldepth: 0, nodes: 0, score: 0, pv: [], timeMs: 0 };
 
-/**
- * Pick a move for the side to move.
- *
- * @param {object} state      chess.js-style game state
- * @param {number} timeLimit  milliseconds of thinking time
- * @param {boolean} useNN     blend the neural network into leaf scores
- * @param {object} [opts]     { history: number[] } zobrist keys of earlier game
- *                            positions, as [lo, hi, lo, hi, …]
- * @returns {object|null}     a chess.js move object, or null if there is none
- */
-export function searchBestMove(state, timeLimit, useNN, opts) {
-  const side = state._sideToMove || (state.sideToMove) || 'white';
-  const uiMoves = getLegalMoves(state, side);
-  if (uiMoves.length === 0) return null;
+// Moves the root must skip. Used to find the second- and third-best moves for
+// hints: search, exclude what was found, search again.
+let rootExclude = null;
 
+function beginSearch(timeLimit, useNN) {
   startTime = Date.now();
   hardLimit = startTime + Math.max(30, timeLimit * 0.95);
-  const softLimit = startTime + timeLimit * 0.5;
   aborted = false;
   nodes = 0;
   seldepth = 0;
   useNNFlag = !!useNN;
   evalCacheFor(useNNFlag);
   ttGen = (ttGen + 1) & 255;
-
   killers.fill(0);
   // History is aged rather than cleared: move quality carries over between
   // moves, but old data should not outweigh what this search learns.
   for (let i = 0; i < historyTbl.length; i++) historyTbl[i] >>= 1;
+}
 
-  pos.setFromState(state, side);
-  if (opts && opts.history && opts.history.length) pos.setHistory(opts.history);
-  else pos.setHistory([pos.keyLo, pos.keyHi]);
-
-  // Nothing to think about with a single legal reply.
-  if (uiMoves.length === 1) {
-    searchInfo.depth = 0; searchInfo.nodes = 0; searchInfo.score = 0;
-    searchInfo.pv = []; searchInfo.timeMs = 0; searchInfo.seldepth = 0;
-    return uiMoves[0];
-  }
-
-  let bestMove = NO_MOVE;
-  let bestScore = 0;
-  let lastCompletedDepth = 0;
-
-  // Never let a stale principal variation from the previous search leak out.
+// One iterative-deepening search from the root, up to the current hard limit.
+// Only completed iterations count; the answer never comes from a search that
+// was cut off partway through.
+function iterate(p, softLimit) {
   pvLength.fill(0);
   pvTable[0] = NO_MOVE;
 
+  let best = NO_MOVE, bestScore = 0, done = 0;
   for (let depth = 1; depth <= MAX_DEPTH; depth++) {
     let score;
     // Aspiration windows: assume the score moved little since the last
     // iteration and re-search wider only when that assumption fails.
     if (depth <= 4) {
-      score = negamax(pos, depth, -INF, INF, 0, true, true, NO_MOVE);
+      score = negamax(p, depth, -INF, INF, 0, true, true, NO_MOVE);
     } else {
       let delta = 25;
       let alpha = Math.max(-INF, bestScore - delta);
       let beta  = Math.min(INF, bestScore + delta);
       while (true) {
-        score = negamax(pos, depth, alpha, beta, 0, true, true, NO_MOVE);
+        score = negamax(p, depth, alpha, beta, 0, true, true, NO_MOVE);
         if (aborted) break;
         if (score <= alpha)      { beta = (alpha + beta) >> 1; alpha = Math.max(-INF, alpha - delta); }
         else if (score >= beta)  { beta = Math.min(INF, beta + delta); }
@@ -558,9 +542,9 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
     if (aborted) break;
     if (pvLength[0] === 0) break;          // terminal root — no move to make
 
-    bestMove = pvTable[0];
+    best = pvTable[0];
     bestScore = score;
-    lastCompletedDepth = depth;
+    done = depth;
     searchInfo.depth = depth;
     searchInfo.seldepth = seldepth;
     searchInfo.nodes = nodes;
@@ -572,16 +556,97 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
     if (Date.now() >= softLimit) break;               // no time for another pass
   }
 
-  // Fall back to the table move if the very first iteration was cut short.
-  if (bestMove === NO_MOVE) {
-    const slot = pos.keyLo & TT_MASK;
-    if (ttFlag[slot] !== 0 && ttKey[slot] === pos.keyHi) bestMove = ttMove[slot];
+  // If even depth 1 was cut short, the table's move is better than nothing —
+  // unless moves are being excluded, in which case it may be one of them.
+  if (best === NO_MOVE && !rootExclude) {
+    const slot = p.keyLo & TT_MASK;
+    if (ttFlag[slot] !== 0 && ttKey[slot] === p.keyHi) best = ttMove[slot];
   }
-  if (bestMove === NO_MOVE) return uiMoves[0];
+  return { move: best, score: bestScore, depth: done };
+}
 
-  searchInfo.depth = lastCompletedDepth;
-  const ui = matchUIMove(bestMove, uiMoves);
-  return ui || uiMoves[0];
+function loadRoot(state, side, opts) {
+  pos.setFromState(state, side);
+  if (opts && opts.history && opts.history.length) pos.setHistory(opts.history);
+  else pos.setHistory([pos.keyLo, pos.keyHi]);
+}
+
+/** Mate distance in moves (signed, from the mover's view), or null. */
+function mateIn(score) {
+  if (Math.abs(score) <= MATE_BOUND) return null;
+  const moves = Math.ceil((MATE - Math.abs(score)) / 2);
+  return score > 0 ? moves : -moves;
+}
+
+/**
+ * Pick a move for the side to move.
+ *
+ * @param {object} state      chess.js-style game state
+ * @param {number} timeLimit  milliseconds of thinking time
+ * @param {boolean} useNN     blend the neural network into leaf scores
+ * @param {object} [opts]     { history: number[] } zobrist keys of earlier game
+ *                            positions, as [lo, hi, lo, hi, …]
+ * @returns {object|null}     a chess.js move object, or null if there is none
+ */
+export function searchBestMove(state, timeLimit, useNN, opts) {
+  const side = state._sideToMove || state.sideToMove || 'white';
+  const uiMoves = getLegalMoves(state, side);
+  if (uiMoves.length === 0) return null;
+
+  beginSearch(timeLimit, useNN);
+  loadRoot(state, side, opts);
+
+  // Nothing to think about with a single legal reply.
+  if (uiMoves.length === 1) {
+    searchInfo.depth = 0; searchInfo.nodes = 0; searchInfo.score = 0;
+    searchInfo.pv = []; searchInfo.timeMs = 0; searchInfo.seldepth = 0;
+    return uiMoves[0];
+  }
+
+  const r = iterate(pos, startTime + timeLimit * 0.5);
+  if (r.move === NO_MOVE) return uiMoves[0];
+  searchInfo.depth = r.depth;
+  return matchUIMove(r.move, uiMoves) || uiMoves[0];
+}
+
+/**
+ * The best `count` moves for the side to move, best first, for hints.
+ *
+ * Found by exclusion: search, remember the best move, search again with it
+ * barred at the root, and so on. Each pass gets an equal share of the time and
+ * starts from the table the previous one filled, so the later passes are
+ * cheaper than they look. Scores are centipawns from the mover's view.
+ *
+ * @returns {{move: object, score: number, mateIn: number|null}[]}
+ */
+export function searchTopMoves(state, timeLimit, count, useNN, opts) {
+  const side = state._sideToMove || state.sideToMove || 'white';
+  const uiMoves = getLegalMoves(state, side);
+  const want = Math.min(count, uiMoves.length);
+  if (want === 0) return [];
+
+  loadRoot(state, side, opts);
+  const per = timeLimit / want;
+  const found = [];
+  const excluded = [];
+
+  try {
+    for (let i = 0; i < want; i++) {
+      beginSearch(per, useNN);
+      rootExclude = excluded.length ? excluded : null;
+      const r = iterate(pos, startTime + per * 0.5);
+      if (r.move === NO_MOVE) break;
+      const ui = matchUIMove(r.move, uiMoves);
+      if (!ui) break;
+      found.push({ move: ui, score: r.score, mateIn: mateIn(r.score) });
+      excluded.push(r.move);
+    }
+  } finally {
+    rootExclude = null;
+  }
+  // Passes can finish a ply apart, which occasionally scores the second find
+  // below the third. Ranking by score keeps "1, 2, 3" meaning best to worst.
+  return found.sort((a, b) => b.score - a.score);
 }
 
 function readPV() {
@@ -643,13 +708,8 @@ export function resetEngine() {
 
 /** Search a Position directly. Used by the test harnesses. */
 export function searchPosition(position, timeLimit, useNN) {
-  startTime = Date.now();
+  beginSearch(timeLimit, useNN);
   hardLimit = startTime + timeLimit;
-  const softLimit = startTime + timeLimit * 0.5;
-  aborted = false; nodes = 0; seldepth = 0; useNNFlag = !!useNN;
-  evalCacheFor(useNNFlag);
-  ttGen = (ttGen + 1) & 255;
-  killers.fill(0);
 
   const p = position;
   if (p.histN === 0) p.setHistory([p.keyLo, p.keyHi]);
@@ -666,35 +726,5 @@ export function searchPosition(position, timeLimit, useNN) {
     return NO_MOVE;
   }
 
-  pvLength.fill(0);
-  pvTable[0] = NO_MOVE;
-
-  let best = NO_MOVE, bestScore = 0;
-  for (let depth = 1; depth <= MAX_DEPTH; depth++) {
-    let score;
-    if (depth <= 4) {
-      score = negamax(p, depth, -INF, INF, 0, true, true, NO_MOVE);
-    } else {
-      let delta = 25;
-      let alpha = Math.max(-INF, bestScore - delta), beta = Math.min(INF, bestScore + delta);
-      while (true) {
-        score = negamax(p, depth, alpha, beta, 0, true, true, NO_MOVE);
-        if (aborted) break;
-        if (score <= alpha)     { beta = (alpha + beta) >> 1; alpha = Math.max(-INF, alpha - delta); }
-        else if (score >= beta) { beta = Math.min(INF, beta + delta); }
-        else break;
-        delta += delta >> 1;
-        if (delta > 1200) { alpha = -INF; beta = INF; }
-      }
-    }
-    if (aborted) break;
-    if (pvLength[0] === 0) break;
-    best = pvTable[0];
-    bestScore = score;
-    searchInfo.depth = depth; searchInfo.seldepth = seldepth; searchInfo.nodes = nodes;
-    searchInfo.score = score; searchInfo.pv = readPV(); searchInfo.timeMs = Date.now() - startTime;
-    if (Math.abs(score) > MATE_BOUND) break;
-    if (Date.now() >= softLimit) break;
-  }
-  return best;
+  return iterate(p, startTime + timeLimit * 0.5).move;
 }

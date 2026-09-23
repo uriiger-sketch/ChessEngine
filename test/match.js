@@ -8,6 +8,7 @@
 //
 // Usage:
 //   node test/match.js --games 20 --ms 300                  new vs old engine
+//   node test/match.js --games 20 --ms 300 --app            as shipped (NN on) vs old
 //   node test/match.js --games 20 --ms 300 --mode nn        new+NN vs new without
 //
 // The Elo figure is the standard logistic conversion of the score rate, with a
@@ -54,9 +55,11 @@ if (MODE === 'nn') {
   // engine has no idea that is what it is — it would treat the correction as
   // the whole score. Running both without it isolates exactly what this
   // comparison is for: the search and the hand evaluation.
-  nameA = 'new engine (hand eval)';
+  // --app plays the new engine exactly as the app ships it: network on.
+  const APP = process.argv.includes('--app');
+  nameA = APP ? 'new engine (as shipped, NN on)' : 'new engine (hand eval)';
   nameB = 'old engine (hand eval)';
-  playerA = (st, side, hist) => searchNew(st, MS, false, { history: hist });
+  playerA = (st, side, hist) => searchNew(st, MS, APP && nnLoaded, { history: hist });
   playerB = (st) => searchOld(st, MS, false);
 }
 

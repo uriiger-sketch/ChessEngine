@@ -6,7 +6,7 @@
 // A CDN-loaded TensorFlow.js could not be imported here, which is why earlier
 // versions had to block the UI thread instead.
 
-import { searchBestMove, resetEngine, searchInfo } from './engine.js';
+import { searchBestMove, searchTopMoves, resetEngine, searchInfo } from './engine.js';
 import { loadModel, isReady as nnIsReady } from './neural.js';
 
 // Load the model once, up front. The main thread waits for the 'ready' message
@@ -20,6 +20,21 @@ self.onmessage = (e) => {
   if (!msg) return;
 
   if (msg.type === 'reset') { resetEngine(); return; }
+
+  // Help mode: the player's best few moves. The page runs these in a second
+  // worker so a hint search can never delay the engine's own move.
+  if (msg.type === 'hints') {
+    try {
+      const hints = searchTopMoves(msg.state, msg.timeLimit, msg.count, msg.useNN && nnIsReady(), {
+        history: msg.history,
+      });
+      self.postMessage({ type: 'hints', id: msg.id, hints });
+    } catch (err) {
+      self.postMessage({ type: 'hints', id: msg.id, hints: [], error: String((err && err.message) || err) });
+    }
+    return;
+  }
+
   if (msg.type !== 'search') return;
 
   try {

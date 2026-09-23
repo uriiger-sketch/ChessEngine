@@ -13,8 +13,11 @@
   --accent:   #759900;
   --btn-bg:   #404040;
   --btn-act:  #759900;
-  /* Board size: fill width in portrait, leave room for controls */
-  --board-size: min(100vw, calc(100svh - 140px));
+  /* Board size: fill the width in portrait, but always leave the controls the
+     height they need (~330px). Reserving too little clipped them on small
+     phones and in laptop windows, where taps then landed on the wrong row. */
+  --controls-h: 332px;
+  --board-size: min(100vw, calc(100svh - var(--controls-h)));
   --sq-size: calc(var(--board-size) / 8);
   --piece-size: calc(var(--sq-size) * 0.82);
 }
@@ -79,6 +82,10 @@ body {
 .sq.light { background: var(--sq-light); }
 .sq.dark  { background: var(--sq-dark); }
 
+/* Pieces sit above the hint arrows (#hint-layer is z-index 5), so a suggested
+   move never hides the piece it is suggesting. */
+.sq .piece-span { position: relative; z-index: 6; pointer-events: none; }
+
 /* Both sides render the same outline glyph shapes — only color differs */
 .sq .piece-w {
   color: #1a1a1a;                         /* near-black fill   */
@@ -136,11 +143,13 @@ body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  padding-bottom: max(10px, env(safe-area-inset-bottom, 0px));
+  gap: 6px;
+  padding: 8px 12px;
+  padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   background: var(--ctrl-bg);
-  overflow: hidden;
+  /* Scroll as a last resort rather than clip: a clipped control can still
+     intercept taps meant for the one beneath it. */
+  overflow-y: auto;
 }
 
 #status {
@@ -216,7 +225,7 @@ body {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  min-height: 38px;
+  min-height: 36px;
   min-width: 44px;
   touch-action: manipulation;
   flex: 1;
@@ -235,37 +244,185 @@ body {
   max-width: 180px;
 }
 
-/* Toggles sit side by side so the extra learning-mode switch costs no height */
-.toggle-row {
-  display: flex;
-  gap: 14px;
-  justify-content: center;
-  flex-wrap: wrap;
-}
-
-.toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: #aaa;
-  cursor: pointer;
-}
-
-.toggle input[type=checkbox] {
-  width: 18px;
-  height: 18px;
-  cursor: pointer;
-}
-
-.toggle.on { color: var(--accent); }
-
 .ctrl-btn:disabled {
   opacity: 0.38;
   cursor: default;
 }
 
-#takeback-btn { background: #4a4a4a; }
+.ctrl-btn { transition: opacity 0.25s ease, background-color 0.25s ease; }
+
+#back-btn { background: #4a4a4a; }
+
+/* ── Mode switch: Play / Learn / Help me ── */
+/* A segmented control whose highlight slides between segments, so changing
+   mode mid-game reads as moving along one control rather than as a jump. */
+#mode-switch {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  padding: 3px;
+}
+
+.mode-thumb {
+  position: absolute;
+  top: 3px; bottom: 3px; left: 3px;
+  width: calc((100% - 6px) / 3);
+  border-radius: 7px;
+  background: var(--accent);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  transition: transform 0.3s cubic-bezier(.4, 0, .2, 1), background-color 0.3s ease;
+}
+#mode-switch[data-mode="learn"] .mode-thumb { transform: translateX(100%); background: #3d7fc4; }
+#mode-switch[data-mode="help"]  .mode-thumb { transform: translateX(200%); background: #c4892f; }
+
+.mode-btn {
+  position: relative;          /* above the thumb */
+  z-index: 1;
+  background: none;
+  border: none;
+  color: #9a9a9a;
+  font-size: 13px;
+  font-weight: 700;
+  min-height: 34px;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: color 0.25s ease;
+}
+.mode-btn[aria-checked="true"] { color: #fff; }
+
+#mode-caption {
+  text-align: center;
+  font-size: 11px;
+  color: #8a8a8a;
+  min-height: 14px;
+  transition: opacity 0.2s ease;
+}
+#mode-caption.swap { opacity: 0; }
+
+/* ── Help mode: suggested moves ── */
+:root {
+  --hint-1: #43b047;
+  --hint-2: #3d9be9;
+  --hint-3: #f0a33a;
+}
+
+#hint-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 5;                  /* over the squares, under the pieces */
+}
+
+.hint-arrow {
+  opacity: 0;
+  animation: hint-in 0.4s ease forwards;
+}
+@keyframes hint-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.hint-arrow { transform-origin: 400px 400px; }
+
+/* Folds open only in Help mode, so the other modes lose no space. */
+#hint-panel {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease, opacity 0.3s ease;
+}
+body.mode-help #hint-panel { max-height: 64px; opacity: 1; }
+
+.hint-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 4px;
+  border-radius: 999px;
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+  animation: hint-in 0.35s ease both;
+}
+.hint-chip .num {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  color: #111;
+}
+.hint-chip.r1 { border-color: var(--hint-1); }
+.hint-chip.r2 { border-color: var(--hint-2); }
+.hint-chip.r3 { border-color: var(--hint-3); }
+.hint-chip.r1 .num { background: var(--hint-1); }
+.hint-chip.r2 .num { background: var(--hint-2); }
+.hint-chip.r3 .num { background: var(--hint-3); }
+.hint-chip .san { font-size: 14px; }
+.hint-chip .score { color: #9a9a9a; font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.hint-note {
+  font-size: 12px;
+  color: #8a8a8a;
+  padding: 5px 0;
+}
+.hint-note .dots::after {
+  content: '';
+  animation: dots 1.2s steps(4, end) infinite;
+}
+@keyframes dots {
+  0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; }
+}
+
+/* ── Confirmation dialog ── */
+#confirm-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+  animation: fade-in 0.18s ease;
+}
+#confirm-modal[hidden] { display: none; }
+
+.confirm-card {
+  background: #2c2c2c;
+  border-radius: 14px;
+  padding: 20px 20px 16px;
+  width: min(300px, calc(100vw - 48px));
+  box-shadow: 0 8px 32px rgba(0,0,0,0.8);
+  text-align: center;
+  animation: pop-in 0.2s cubic-bezier(.2, .9, .3, 1.2);
+}
+#confirm-title { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
+#confirm-sub   { font-size: 13px; color: #aaa; margin-bottom: 16px; }
+.confirm-actions { display: flex; gap: 10px; }
+.confirm-actions .ctrl-btn { max-width: none; }
+.confirm-yes { background: var(--btn-act); color: #fff; }
+
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pop-in  { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .mode-thumb, .ctrl-btn, #hint-panel, .hint-arrow, .hint-chip,
+  #confirm-modal, .confirm-card { transition: none; animation: none; opacity: 1; }
+}
 
 /* ── Promotion Modal ── */
 #promo-modal {
@@ -351,10 +508,13 @@ body {
   opacity: 0.8;
 }
 
-/* ── Landscape override: side-by-side layout ── */
-@media (orientation: landscape) and (max-height: 600px) {
+/* ── Landscape: board and controls side by side ── */
+/* Any window wider than tall — phone on its side, tablet, laptop — has
+   height to spare only for the board, so the controls move into a column. */
+@media (orientation: landscape) {
   :root {
-    --board-size: min(100svh, calc(100vw - 180px));
+    --panel-w: clamp(170px, 28vw, 300px);
+    --board-size: min(100svh, calc(100vw - var(--panel-w)));
   }
   body {
     flex-direction: row;
@@ -362,9 +522,13 @@ body {
     justify-content: center;
   }
   #controls {
-    width: 170px;
-    height: 100%;
+    width: var(--panel-w);
+    height: 100svh;
     max-width: none;
     padding: 10px 8px;
   }
+}
+/* Narrow landscape column (phones): tighten labels so "Help me" fits. */
+@media (orientation: landscape) and (max-width: 700px) {
+  .mode-btn { font-size: 11px; }
 }
