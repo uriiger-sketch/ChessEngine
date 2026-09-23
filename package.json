@@ -1,10 +1,18 @@
 {
   "name": "chess-nn-pwa",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Neural network chess engine PWA for iPhone",
   "type": "module",
   "scripts": {
     "serve": "python3 -m http.server 8080",
-    "train": "cd train && npm install && node train.js"
+    "train": "cd train && npm install && node train.js",
+    "test": "npm run test:perft && npm run test:eval && npm run test:tactics",
+    "test:perft": "node test/perft.js",
+    "test:perft:deep": "node test/perft.js --deep",
+    "test:eval": "node test/eval.js --nn",
+    "test:tactics": "node test/tactics.js --ms 1000 --nn",
+    "test:browser": "NODE_PATH=/opt/node22/lib/node_modules node test/browser.js",
+    "match": "node test/match.js --games 40 --ms 300",
+    "match:nn": "node test/match.js --games 40 --ms 300 --mode nn"
   }
 }

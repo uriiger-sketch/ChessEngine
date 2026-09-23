@@ -1,440 +1,700 @@
 'use strict';
-// Chess AI engine — iterative deepening alpha-beta with:
-//   • Abort-on-timeout (only completes full iterations)
-//   • Transposition table with move storage
-//   • Killer moves (2 per ply)
-//   • History heuristic
-//   • Null-move pruning (R=3 deep, R=2 shallow)
-//   • Late-move reduction (LMR)
-//   • Aspiration windows in iterative deepening
+// Search — negamax with alpha-beta, principal variation search, and the usual
+// modern pruning set.
+//
+// What changed from the previous engine, and why it matters:
+//
+//  • Negamax instead of an explicit min/max split. The old code carried a
+//    `maximize` flag through every branch and duplicated each comparison for
+//    the two cases, which is where sign bugs live. Here one side's score is
+//    just the negation of the other's.
+//  • Make/unmake on a single board (js/position.js) instead of cloning a 2-D
+//    array per node. This is the difference between roughly 100k and several
+//    million nodes per second.
+//  • The transposition key now covers castling rights and en passant. It did
+//    not before, so positions that differed only in those respects shared an
+//    entry and returned each other's scores.
+//  • Mate scores are stored relative to the node, not the root, so a mate found
+//    through the table reports the right distance.
+//  • Draws by repetition, the fifty-move rule and insufficient material are
+//    recognised inside the search. Previously the engine could not see a
+//    perpetual coming and would walk into or throw away a drawn line.
+//  • Quiescence answers checks instead of standing pat on them, and throws out
+//    losing captures with a static exchange evaluation.
 
 import {
-  generateMoves, makeMove, getLegalMoves, isInCheck,
-  evaluatePosition, opposite
-} from './chess.js';
-
-import { evaluate as nnEvaluate, isReady as nnIsReady } from './neural.js';
+  Position, MAX_PLY,
+  mvFrom, mvTo, mvPromo, mvPiece, mvCapType, mvIsCap, mvIsQuiet,
+  matchUIMove, NO_MOVE
+} from './position.js';
+import { evaluate as handEvaluate } from './evaluate.js';
+import { getLegalMoves } from './chess.js';
+import { evaluate as nnEvaluate, isReady as nnIsReady, isResidual as nnIsResidual } from './neural.js';
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const MAX_DEPTH  = 14;
-const MATE_SCORE = 5000;
-// Share of the leaf evaluation taken from the neural net vs the hand-crafted
-// evaluation. The hand eval keeps tactical material accounting exact; the net
-// contributes the positional judgement learned from master games.
-const NN_WEIGHT  = 0.4;
-// Piece values for MVV-LVA and SEE (indexed by abs piece code)
-const MV_VAL = [0, 100, 320, 330, 500, 900, 20000];
+const MAX_DEPTH   = 64;
+const MATE        = 32000;
+const MATE_BOUND  = MATE - 1024;   // scores above this are mates
+const INF         = 32767;
 
-// ── Transposition Table ────────────────────────────────────────────────────
-const TT_SIZE = 1 << 20; // 1 048 576 entries (~16 MB)
+// ── The neural network's role, and what it is actually worth ───────────────
+//
+// The network is trained only on the repository's master PGN files (see
+// train/train.js) and outputs a bounded positional CORRECTION, which is added
+// to the hand evaluation rather than averaged with it. Averaging would drag
+// material toward whatever the network says; adding a clamped correction
+// cannot, so material always survives intact.
+//
+// Then it was measured, by self-play at equal time — network on versus the same
+// engine with it off, 20-40 games per setting, colours swapped each pair:
+//
+//     gain 1.00, network also used for pruning   11.3%   -359 Elo
+//     gain 1.00, pruning on hand eval only       15.0%   -301 Elo
+//     gain 0.60, pruning on hand eval only       27.5%   -168 Elo
+//     gain 0.40, network also used for pruning   35.0%   -108 Elo
+//     gain 0.35, pruning on hand eval only       40.8%    -65 Elo  (60 games)
+//     gain 0.00  (network off)                      —        baseline
+//
+// The trend is monotone: the less the network is applied, the stronger the
+// engine plays. So the network does NOT improve playing strength here, and
+// saying otherwise would be wishful. Two things explain it. The label is a game
+// result, which at the level of a single position is mostly noise — the network
+// learns a smooth prior, and inside a search that prior is usually less
+// informed than the search's own deeper look. And inference is not free: it
+// roughly halves the node rate, so it has to earn its keep before it breaks
+// even, which it does not.
+//
+// Hence: the toggle ships OFF, the engine's default is its strongest setting,
+// and the constants below are the best configuration measured for anyone who
+// turns it on. NN_SPLIT_EVAL keeps the correction out of the pruning margins
+// (reverse futility, razoring, null move), which are tuned to the hand
+// evaluation's scale and were the single most damaging place to inject noise —
+// worth about 130 Elo on its own at gain 1.0.
+//
+// The natural next step, if this is revisited, is not a better value network
+// but a policy one: use the master games to ORDER moves rather than to score
+// positions. Bad ordering only costs a little speed, where a bad score changes
+// which move gets played.
+let NN_GAIN = 0.35;
+let NN_SPLIT_EVAL = true;
+
+/** Tuning hooks for test/match.js, so these numbers stay measurable. */
+export function setNNGain(g)      { NN_GAIN = g; evOk.fill(0); evCachedWithNN = null; }
+export function getNNGain()       { return NN_GAIN; }
+export function setNNSplitEval(v) { NN_SPLIT_EVAL = !!v; evOk.fill(0); evCachedWithNN = null; }
+
+// Fallback blend weight, used only for an older absolute-scoring model.
+const NN_WEIGHT = 0.35;
+
+const MVV = [0, 100, 320, 330, 500, 900, 0];
+
+// ── Transposition table ────────────────────────────────────────────────────
+const TT_BITS = 20;
+const TT_SIZE = 1 << TT_BITS;
 const TT_MASK = TT_SIZE - 1;
-const ttKeyLo  = new Uint32Array(TT_SIZE);
-const ttKeyHi  = new Uint32Array(TT_SIZE);
-const ttScore  = new Int32Array(TT_SIZE);
-const ttDepth  = new Uint8Array(TT_SIZE);
-const ttFlag   = new Uint8Array(TT_SIZE); // 0=exact 1=lower 2=upper
-const ttMoves  = new Array(TT_SIZE).fill(null); // best move per entry
+const ttKey   = new Int32Array(TT_SIZE);   // keyHi, used to verify the slot
+const ttMove  = new Int32Array(TT_SIZE);
+const ttScore = new Int32Array(TT_SIZE);
+const ttDepth = new Int8Array(TT_SIZE);
+const ttFlag  = new Uint8Array(TT_SIZE);   // 0 empty, 1 exact, 2 lower, 3 upper
+const ttAge   = new Uint8Array(TT_SIZE);
+let   ttGen   = 0;
 
-// ── Zobrist Keys ───────────────────────────────────────────────────────────
-const ZLO = new Uint32Array(769); // 768 piece-square + 1 side-to-move
-const ZHI = new Uint32Array(769);
-(function() {
-  let s = 7;
-  const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
-  for (let i = 0; i < 769; i++) { ZLO[i] = next(); ZHI[i] = next(); }
+function ttClear() {
+  ttKey.fill(0); ttMove.fill(0); ttScore.fill(0);
+  ttDepth.fill(0); ttFlag.fill(0); ttAge.fill(0);
+}
+
+// ── Evaluation cache ───────────────────────────────────────────────────────
+// A neural forward pass costs far more than the hand evaluation, and searches
+// revisit the same positions constantly, so leaf scores are memoised.
+const EV_BITS = 18;
+const EV_SIZE = 1 << EV_BITS;
+const EV_MASK = EV_SIZE - 1;
+const evKey = new Int32Array(EV_SIZE);
+const evVal = new Int32Array(EV_SIZE);
+const evOk  = new Uint8Array(EV_SIZE);
+
+// Cached scores are only valid for the network setting they were computed
+// under, and the setting changes whenever the player flips the toggle. Rather
+// than widen the key, drop the cache when it changes — which is rare.
+let evCachedWithNN = null;
+function evalCacheFor(useNN) {
+  if (evCachedWithNN !== useNN) { evOk.fill(0); evCachedWithNN = useNN; }
+}
+
+// ── Heuristic tables ───────────────────────────────────────────────────────
+const killers     = new Int32Array(MAX_PLY * 2);
+const historyTbl  = new Int32Array(2 * 64 * 64);
+const counterTbl  = new Int32Array(2 * 7 * 64);
+const moveScores  = new Int32Array(MAX_PLY * 256);
+
+const pvLength = new Int32Array(MAX_PLY);
+const pvTable  = new Int32Array(MAX_PLY * MAX_PLY);
+
+// Reduction table: deeper searches and later moves get cut harder.
+const LMR = new Int32Array(64 * 64);
+(function buildLMR() {
+  for (let d = 1; d < 64; d++)
+    for (let m = 1; m < 64; m++)
+      LMR[d * 64 + m] = Math.max(0, (0.75 + Math.log(d) * Math.log(m) / 2.25) | 0);
 })();
 
-function zIdx(piece, r, c) {
-  return (piece > 0 ? piece - 1 : 6 + (-piece) - 1) * 64 + r * 8 + c;
-}
+// ── Search state ───────────────────────────────────────────────────────────
+let aborted    = false;
+let startTime  = 0;
+let hardLimit  = 0;
+let nodes      = 0;
+let useNNFlag  = false;
+let seldepth   = 0;
 
-function computeZobrist(state) {
-  let lo = 0, hi = 0;
-  for (let r = 0; r < 8; r++)
-    for (let c = 0; c < 8; c++) {
-      const p = state.board[r][c];
-      if (p) { const i = zIdx(p,r,c); lo ^= ZLO[i]; hi ^= ZHI[i]; }
-    }
-  return [lo, hi];
-}
+const pos = new Position();
 
-function updateZobrist(lo, hi, mv, board) {
-  const [fr,fc] = mv.from, [tr,tc] = mv.to;
-  const orig = board[fr][fc]; // original piece at source (before promotion)
+// ── Leaf evaluation ────────────────────────────────────────────────────────
+// `forPruning` asks for the hand evaluation alone. The pruning margins
+// (reverse futility, razoring, null move) are tuned against the hand
+// evaluation's scale and are very sensitive to noise in it — a wrong decision
+// there discards a whole subtree, where a wrong leaf score only misvalues one.
+function evalLeaf(p, forPruning) {
+  const slot = p.keyLo & EV_MASK;
+  if (!forPruning && evOk[slot] && evKey[slot] === p.keyHi) return evVal[slot];
 
-  const iFrom = zIdx(orig, fr, fc);
-  lo ^= ZLO[iFrom]; hi ^= ZHI[iFrom];
+  let v = handEvaluate(p);
+  if (forPruning) return v;
 
-  if (mv.captured) {
-    const capR = mv.enPassant ? fr : tr;
-    const capC = tc;
-    const iCap = zIdx(mv.captured, capR, capC);
-    lo ^= ZLO[iCap]; hi ^= ZHI[iCap];
-  }
-
-  const iTo = zIdx(mv.piece, tr, tc);
-  lo ^= ZLO[iTo]; hi ^= ZHI[iTo];
-
-  if (mv.castle) {
-    if (tr===7&&tc===6){lo^=ZLO[zIdx(4,7,7)]^ZLO[zIdx(4,7,5)];hi^=ZHI[zIdx(4,7,7)]^ZHI[zIdx(4,7,5)];}
-    if (tr===7&&tc===2){lo^=ZLO[zIdx(4,7,0)]^ZLO[zIdx(4,7,3)];hi^=ZHI[zIdx(4,7,0)]^ZHI[zIdx(4,7,3)];}
-    if (tr===0&&tc===6){lo^=ZLO[zIdx(-4,0,7)]^ZLO[zIdx(-4,0,5)];hi^=ZHI[zIdx(-4,0,7)]^ZHI[zIdx(-4,0,5)];}
-    if (tr===0&&tc===2){lo^=ZLO[zIdx(-4,0,0)]^ZLO[zIdx(-4,0,3)];hi^=ZHI[zIdx(-4,0,0)]^ZHI[zIdx(-4,0,3)];}
-  }
-
-  lo ^= ZLO[768]; hi ^= ZHI[768]; // flip side-to-move
-  return [lo, hi];
-}
-
-// ── Search Heuristic Tables ────────────────────────────────────────────────
-const MAX_PLY = 64;
-// Killer moves: [ply][0|1]
-const killers = Array.from({length: MAX_PLY}, () => [null, null]);
-// History: keyed by (piece+6)*64 + to_square → higher = better quiet move
-const historyTable = new Int32Array(13 * 64);
-
-function histIdx(mv) { return (mv.piece + 6) * 64 + mv.to[0] * 8 + mv.to[1]; }
-
-function addKiller(mv, ply) {
-  if (ply >= MAX_PLY) return;
-  const k = killers[ply];
-  if (!mvEq(k[0], mv)) { k[1] = k[0]; k[0] = mv; }
-}
-
-function addHistory(mv, depth) {
-  const i = histIdx(mv);
-  historyTable[i] += depth * depth;
-  if (historyTable[i] > 32000) {
-    for (let j = 0; j < historyTable.length; j++) historyTable[j] >>= 2;
-  }
-}
-
-function mvEq(a, b) {
-  return a && b &&
-    a.from[0] === b.from[0] && a.from[1] === b.from[1] &&
-    a.to[0]   === b.to[0]   && a.to[1]   === b.to[1]   &&
-    a.piece   === b.piece;
-}
-
-// ── Move Scoring & Sorting ─────────────────────────────────────────────────
-function scoreMove(mv, ply, ttMv) {
-  if (mvEq(mv, ttMv))       return 10_000_000; // TT move first
-  if (mv.captured || mv.enPassant) {
-    const vic = MV_VAL[Math.abs(mv.captured || 1)];
-    const att = MV_VAL[Math.abs(mv.piece)];
-    return 1_000_000 + vic * 10 - att;          // MVV-LVA for captures
-  }
-  if (mv.promotion)          return 900_000;
-  const k = killers[ply < MAX_PLY ? ply : 0];
-  if (mvEq(mv, k[0]))       return 800_000;
-  if (mvEq(mv, k[1]))       return 700_000;
-  return historyTable[histIdx(mv)];              // history heuristic
-}
-
-function sortMoves(moves, ply, ttMv) {
-  const n = moves.length;
-  const sc = new Int32Array(n);
-  for (let i = 0; i < n; i++) sc[i] = scoreMove(moves[i], ply, ttMv);
-  // Insertion sort — fast for small arrays typical in chess
-  for (let i = 1; i < n; i++) {
-    const s = sc[i], m = moves[i];
-    let j = i - 1;
-    while (j >= 0 && sc[j] < s) { sc[j+1] = sc[j]; moves[j+1] = moves[j]; j--; }
-    sc[j+1] = s; moves[j+1] = m;
-  }
-}
-
-// ── Evaluation ─────────────────────────────────────────────────────────────
-// evaluatePosition() is Black-positive centipawns; the net returns White-positive
-// pawn units, so it needs both a sign flip and a ×100 scale conversion. The two
-// are combined as a weighted blend rather than a sum — adding them would count
-// material twice, and previously the missing ×100 left the net contributing at
-// most ~37cp, i.e. effectively nothing.
-// Network inference costs ~50µs versus ~5µs for the hand evaluation, so leaf
-// scores are memoised by Zobrist key. Searches revisit positions constantly,
-// which makes this cache worth far more than micro-optimising the forward pass.
-const EV_SIZE = 1 << 18;
-const EV_MASK = EV_SIZE - 1;
-const evKeyLo = new Int32Array(EV_SIZE);
-const evKeyHi = new Int32Array(EV_SIZE);
-const evVal   = new Float32Array(EV_SIZE);
-const evUsed  = new Uint8Array(EV_SIZE);
-
-function evalPosition(state, useNN, lo, hi) {
-  const useCache = lo !== undefined;
-  let slot = 0;
-  if (useCache) {
-    slot = lo & EV_MASK;
-    if (evUsed[slot] && evKeyLo[slot] === (lo | 0) && evKeyHi[slot] === (hi | 0)) {
-      return evVal[slot];
+  if (useNNFlag && NN_GAIN !== 0 && nnIsReady()) {
+    const s = nnEvaluate(p.board, p.stm, p.castling);
+    if (s !== null) {
+      // The net reports pawn units from White's point of view; the search works
+      // in centipawns from the side to move's.
+      const nnCp = s * 100 * (p.stm > 0 ? 1 : -1);
+      v = nnIsResidual()
+        ? (v + NN_GAIN * nnCp) | 0
+        : ((1 - NN_WEIGHT) * v + NN_WEIGHT * nnCp) | 0;
     }
   }
 
-  const hand = evaluatePosition(state);
-  let val = hand;
-  if (useNN && nnIsReady()) {
-    const s = nnEvaluate(state.board);
-    if (s !== null) val = (1 - NN_WEIGHT) * hand + NN_WEIGHT * (-s * 100);
-  }
-
-  if (useCache) {
-    evKeyLo[slot] = lo | 0; evKeyHi[slot] = hi | 0;
-    evVal[slot] = val; evUsed[slot] = 1;
-  }
-  return val;
+  evKey[slot] = p.keyHi; evVal[slot] = v; evOk[slot] = 1;
+  return v;
 }
 
-// ── Endgame detection (suppress null-move in low-material positions) ───────
-function isEndgame(board) {
-  let major = 0;
-  for (let r = 0; r < 8; r++)
-    for (let c = 0; c < 8; c++) {
-      const p = Math.abs(board[r][c]);
-      if (p >= 2 && p <= 5) major++;
-    }
-  return major <= 4;
-}
+// ── Move ordering ──────────────────────────────────────────────────────────
+function scoreMoves(p, n, ttMv, ply, prevMove) {
+  const base = p.ply * 256;
+  const buf = p.moveBuf;
+  const side = p.stm > 0 ? 0 : 1;
+  const k0 = killers[ply * 2], k1 = killers[ply * 2 + 1];
 
-// ── Quiescence Search ──────────────────────────────────────────────────────
-function quiescence(state, lo, hi, alpha, beta, side, useNN, qDepth) {
-  if (aborted) return 0;
-
-  const maximize = side === 'black';
-  const standPat = evalPosition(state, useNN, lo, hi);
-
-  if (maximize) {
-    if (standPat >= beta) return beta;
-    if (standPat > alpha) alpha = standPat;
-  } else {
-    if (standPat <= alpha) return alpha;
-    if (standPat < beta) beta = standPat;
+  let counter = NO_MOVE;
+  if (prevMove !== NO_MOVE) {
+    counter = counterTbl[(side * 7 + mvPiece(prevMove)) * 64 + mvTo(prevMove)];
   }
 
-  // Delta pruning: skip if no capture can possibly improve
-  const DELTA = 1000;
-  if (maximize && standPat < alpha - DELTA) return alpha;
-  if (!maximize && standPat > beta + DELTA)  return beta;
-
-  // Limit quiescence depth to avoid explosion
-  if (qDepth <= 0) return standPat;
-
-  const caps = generateMoves(state, side).filter(mv => mv.captured || mv.enPassant);
-  sortMoves(caps, 0, null);
-
-  let best = standPat;
-  for (const mv of caps) {
-    if (aborted) break;
-    const child = makeMove(state, mv);
-    if (isInCheck(child, side)) continue;
-    const [nlo, nhi] = updateZobrist(lo, hi, mv, state.board);
-    const score = quiescence(child, nlo, nhi, alpha, beta, opposite(side), useNN, qDepth - 1);
-
-    if (maximize) {
-      if (score > best) best = score;
-      if (score > alpha) alpha = score;
+  for (let i = 0; i < n; i++) {
+    const m = buf[base + i];
+    let s;
+    if (m === ttMv) {
+      s = 1 << 30;
+    } else if (mvIsCap(m) || mvPromo(m)) {
+      const gain = MVV[mvCapType(m)] * 16 - MVV[mvPiece(m)] + (mvPromo(m) ? MVV[mvPromo(m)] : 0);
+      // Losing captures are searched after the quiet moves, not before them.
+      s = p.see(m) >= 0 ? (1 << 28) + gain : -(1 << 28) + gain;
+    } else if (m === k0) {
+      s = (1 << 27);
+    } else if (m === k1) {
+      s = (1 << 27) - 1;
+    } else if (m === counter) {
+      s = (1 << 26);
     } else {
-      if (score < best) best = score;
-      if (score < beta) beta = score;
+      s = historyTbl[(side * 64 + mvFrom(m)) * 64 + mvTo(m)];
     }
-    if (alpha >= beta) break;
+    moveScores[base + i] = s;
   }
+}
+
+// Selection sort one move at a time: most nodes cut off after a handful of
+// moves, so sorting the whole list up front would be wasted work.
+function pickMove(p, n, i) {
+  const base = p.ply * 256;
+  const buf = p.moveBuf;
+  let best = i;
+  for (let j = i + 1; j < n; j++) if (moveScores[base + j] > moveScores[base + best]) best = j;
+  if (best !== i) {
+    const tm = buf[base + i]; buf[base + i] = buf[base + best]; buf[base + best] = tm;
+    const ts = moveScores[base + i]; moveScores[base + i] = moveScores[base + best]; moveScores[base + best] = ts;
+  }
+  return buf[base + i];
+}
+
+function recordQuiet(p, m, depth, ply, prevMove) {
+  const side = p.stm > 0 ? 0 : 1;
+  const k = ply * 2;
+  if (killers[k] !== m) { killers[k + 1] = killers[k]; killers[k] = m; }
+
+  const idx = (side * 64 + mvFrom(m)) * 64 + mvTo(m);
+  historyTbl[idx] += depth * depth;
+  if (historyTbl[idx] > 1 << 20) {
+    for (let i = 0; i < historyTbl.length; i++) historyTbl[i] >>= 4;
+  }
+
+  if (prevMove !== NO_MOVE) {
+    counterTbl[(side * 7 + mvPiece(prevMove)) * 64 + mvTo(prevMove)] = m;
+  }
+}
+
+// ── Quiescence ─────────────────────────────────────────────────────────────
+// Only searching captures leaves the engine blind when it is in check, so check
+// positions here generate every legal reply instead of standing pat.
+//
+// That is limited to the first few quiescence plies. A position where one side
+// can check forever otherwise expands without bound — the ply ceiling and the
+// clock would stop it eventually, but not before a single node had swallowed
+// the whole move's thinking time.
+const Q_CHECK_PLIES = 3;
+
+function quiescence(p, alpha, beta, ply, qPly = 0) {
+  if ((++nodes & 2047) === 0 && Date.now() >= hardLimit) aborted = true;
+  if (aborted) return 0;
+  if (ply > seldepth) seldepth = ply;
+
+  if (p.isRepetition() || p.isFiftyMove() || p.insufficientMaterial()) return 0;
+  if (p.ply >= MAX_PLY - 4) return evalLeaf(p);
+
+  const inCheck = p.inCheck() && qPly < Q_CHECK_PLIES;
+  let best = -INF;
+
+  if (!inCheck) {
+    best = evalLeaf(p);
+    if (best >= beta) return best;
+    if (best > alpha) alpha = best;
+  }
+
+  const n = p.generate(p.ply, !inCheck);
+  const base = p.ply * 256;
+  scoreMoves(p, n, NO_MOVE, ply, NO_MOVE);
+
+  let legal = 0;
+  for (let i = 0; i < n; i++) {
+    const m = pickMove(p, n, i);
+
+    if (!inCheck) {
+      // Delta pruning: even winning this piece outright would not reach alpha.
+      if (!mvPromo(m) && best + MVV[mvCapType(m)] + 200 < alpha) continue;
+      // Throw away captures that lose material on the exchange.
+      if (p.see(m) < 0) continue;
+    }
+
+    if (!p.makeMove(m)) continue;
+    legal++;
+    const score = -quiescence(p, -beta, -alpha, ply + 1, qPly + 1);
+    p.unmakeMove();
+
+    if (aborted) return 0;
+    if (score > best) {
+      best = score;
+      if (score > alpha) alpha = score;
+      if (alpha >= beta) break;
+    }
+  }
+
+  if (inCheck && legal === 0) return -MATE + ply;   // checkmate
   return best;
 }
 
-// ── Alpha-Beta Search ──────────────────────────────────────────────────────
-let aborted      = false;
-let startTime    = 0;
-let timeLimitMs  = 5000;
-let nodeCount    = 0;
+// ── Main search ────────────────────────────────────────────────────────────
+function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
+  if ((++nodes & 2047) === 0 && Date.now() >= hardLimit) aborted = true;
+  if (aborted) return 0;
 
-function search(state, lo, hi, depth, alpha, beta, side, ply, useNN, isNullMove) {
-  // Periodic time check. Checked every 512 nodes rather than 2048: a neural
-  // leaf evaluation costs ~50µs, so a coarser interval can overshoot the
-  // budget noticeably before the abort is noticed.
-  if ((++nodeCount & 511) === 0 && Date.now() - startTime >= timeLimitMs) {
-    aborted = true;
+  pvLength[ply] = ply;
+
+  if (ply > 0) {
+    if (p.isRepetition() || p.isFiftyMove() || p.insufficientMaterial()) return 0;
+    if (p.ply >= MAX_PLY - 4) return evalLeaf(p);
+
+    // Mate-distance pruning: a mate already found closer to the root cannot be
+    // beaten by anything down here.
+    if (alpha < -MATE + ply) alpha = -MATE + ply;
+    if (beta > MATE - ply - 1) beta = MATE - ply - 1;
+    if (alpha >= beta) return alpha;
   }
-  if (aborted) return [null, 0];
 
-  const maximize = side === 'black';
-  const idx = (lo >>> 0) & TT_MASK;
-  let ttMv = null;
+  if (depth <= 0) return quiescence(p, alpha, beta, ply);
 
-  // Transposition table probe
-  if (ttKeyLo[idx] === lo && ttKeyHi[idx] === hi) {
-    ttMv = ttMoves[idx];
-    if (ttDepth[idx] >= depth) {
-      const ts = ttScore[idx], tf = ttFlag[idx];
-      if (tf === 0) return [ttMv, ts];
-      if (tf === 1 && ts >= beta)  return [ttMv, ts];
-      if (tf === 2 && ts <= alpha) return [ttMv, ts];
+  const slot = p.keyLo & TT_MASK;
+  let ttMv = NO_MOVE;
+  if (ttFlag[slot] !== 0 && ttKey[slot] === p.keyHi) {
+    ttMv = ttMove[slot];
+    if (!isPV && ttDepth[slot] >= depth) {
+      let s = ttScore[slot];
+      // Mate scores are stored relative to this node; put the distance back.
+      if (s > MATE_BOUND) s -= ply;
+      else if (s < -MATE_BOUND) s += ply;
+      const f = ttFlag[slot];
+      if (f === 1) return s;
+      if (f === 2 && s >= beta) return s;
+      if (f === 3 && s <= alpha) return s;
     }
   }
 
-  // Leaf node → quiescence
-  if (depth <= 0) return [null, quiescence(state, lo, hi, alpha, beta, side, useNN, 6)];
+  const inCheck = p.inCheck();
+  if (inCheck) depth++;                       // check extension
 
-  const inCheck = isInCheck(state, side);
+  const staticEval = inCheck ? -INF : evalLeaf(p, NN_SPLIT_EVAL);
 
-  // Check extension: don't reduce depth when in check
-  if (inCheck) depth++;
+  if (!isPV && !inCheck && Math.abs(beta) < MATE_BOUND) {
+    // Reverse futility: we are so far ahead that even giving up material would
+    // hold beta, so there is nothing to prove here.
+    if (depth <= 7 && staticEval - 80 * depth >= beta) return staticEval;
 
-  // Null-move pruning (skip if: in check, null move already done, endgame, shallow depth)
-  if (!isNullMove && !inCheck && depth >= 3 && !isEndgame(state.board)) {
-    const R = depth >= 6 ? 3 : 2;
-    const nullState = { ...state, enPassantTarget: null, _sideToMove: opposite(side) };
-    const [nlo, nhi] = [lo ^ ZLO[768], hi ^ ZHI[768]];
-    const [, ns] = search(nullState, nlo, nhi, depth - R - 1, alpha, beta, opposite(side), ply + 1, false, true);
-    if (!aborted) {
-      if (maximize && ns >= beta) return [null, beta];
-      if (!maximize && ns <= alpha) return [null, alpha];
+    // Razoring: so far behind that only a tactic saves it — let quiescence look.
+    if (depth <= 3 && staticEval + 300 * depth < alpha) {
+      const q = quiescence(p, alpha, beta, ply);
+      if (q < alpha) return q;
+    }
+
+    // Null move: hand the opponent a free move; if we are still winning, this
+    // node is not worth a full search. Skipped without pieces, where zugzwang
+    // makes the assumption false.
+    if (canNull && depth >= 3 && staticEval >= beta && p.hasNonPawnMaterial()) {
+      // Clamped so the reduced search keeps at least one ply: an unclamped
+      // reduction at shallow depth drops straight into quiescence, which tells
+      // us almost nothing and prunes on almost nothing.
+      let R = 3 + ((depth / 4) | 0) + Math.min(3, ((staticEval - beta) / 200) | 0);
+      if (R > depth - 1) R = depth - 1;
+      p.makeNull();
+      const s = -negamax(p, depth - R - 1, -beta, -beta + 1, ply + 1, false, false, NO_MOVE);
+      p.unmakeNull();
+      if (aborted) return 0;
+      if (s >= beta) {
+        if (s >= MATE_BOUND) return beta;     // don't trust mates found via a null move
+        if (depth < 10) return s;
+        // Deep nodes get a verification search with null move disabled.
+        const v = negamax(p, depth - R - 1, beta - 1, beta, ply, false, false, prevMove);
+        if (aborted) return 0;
+        if (v >= beta) return s;
+      }
     }
   }
 
-  const legal = getLegalMoves(state, side);
-
-  if (legal.length === 0) {
-    return [null, inCheck
-      ? (maximize ? -MATE_SCORE + ply : MATE_SCORE - ply)
-      : 0];
+  // Internal iterative deepening: with no table move, a shallow search is a
+  // cheaper way to find one than searching the moves in a bad order.
+  if (ttMv === NO_MOVE && depth >= 5 && isPV) {
+    negamax(p, depth - 3, alpha, beta, ply, isPV, false, prevMove);
+    if (aborted) return 0;
+    if (ttFlag[slot] !== 0 && ttKey[slot] === p.keyHi) ttMv = ttMove[slot];
   }
 
-  sortMoves(legal, ply, ttMv);
+  const n = p.generate(p.ply, false);
+  scoreMoves(p, n, ttMv, ply, prevMove);
 
-  let bestMove = null;
-  let bestScore = maximize ? -Infinity : Infinity;
-  const origAlpha = alpha, origBeta = beta;
+  const origAlpha = alpha;
+  let bestScore = -INF;
+  let bestMove  = NO_MOVE;
+  let moveCount = 0;
 
-  for (let i = 0; i < legal.length; i++) {
-    if (aborted) break;
-    const mv = legal[i];
-    const child = makeMove(state, mv);
-    const [nlo, nhi] = updateZobrist(lo, hi, mv, state.board);
-    const isCapOrPromo = mv.captured || mv.enPassant || mv.promotion;
-    const givesCheck = isInCheck(child, opposite(side));
+  const futile = !isPV && !inCheck && depth <= 6 &&
+                 staticEval + 120 + 130 * depth <= alpha && Math.abs(alpha) < MATE_BOUND;
+
+  for (let i = 0; i < n; i++) {
+    const m = pickMove(p, n, i);
+    const quiet = mvIsQuiet(m);
+
+    // Skip obviously losing captures in shallow, non-PV nodes.
+    if (!isPV && !inCheck && depth <= 5 && moveCount > 0 && !quiet &&
+        bestScore > -MATE_BOUND && p.see(m) < -50 * depth) continue;
+
+    if (!p.makeMove(m)) continue;
+    moveCount++;
+
+    const givesCheck = p.inCheck();
+
+    if (quiet && moveCount > 1 && bestScore > -MATE_BOUND && !isPV && !inCheck && !givesCheck) {
+      // Late move pruning: this late in a well-ordered list, quiet moves at
+      // shallow depth essentially never turn out to be best.
+      if (depth <= 6 && moveCount > 4 + depth * depth) { p.unmakeMove(); continue; }
+      if (futile) { p.unmakeMove(); continue; }
+    }
 
     let score;
-
-    // Late Move Reduction: quiet, non-checking, non-first moves at depth >= 3
-    const doLMR = depth >= 3 && i >= 3 && !isCapOrPromo && !givesCheck && !inCheck;
-    if (doLMR) {
-      // Reduction amount scales with move index and depth
-      const R = 1 + (i >= 6 ? 1 : 0) + (depth >= 8 && i >= 12 ? 1 : 0);
-      // Reduced search with a null window
-      let nullAlpha = maximize ? alpha     : beta - 1;
-      let nullBeta  = maximize ? alpha + 1 : beta;
-      const [, lmrScore] = search(child, nlo, nhi, depth - 1 - R, nullAlpha, nullBeta, opposite(side), ply + 1, useNN, false);
-
-      if (aborted) break;
-
-      // If LMR score improves alpha (and we didn't prune), re-search at full depth
-      const needFull = maximize ? lmrScore > alpha : lmrScore < beta;
-      if (needFull) {
-        const [, full] = search(child, nlo, nhi, depth - 1, alpha, beta, opposite(side), ply + 1, useNN, false);
-        score = full;
-      } else {
-        score = lmrScore;
-      }
+    if (moveCount === 1) {
+      score = -negamax(p, depth - 1, -beta, -alpha, ply + 1, isPV, true, m);
     } else {
-      const [, s] = search(child, nlo, nhi, depth - 1, alpha, beta, opposite(side), ply + 1, useNN, false);
-      score = s;
+      let r = 0;
+      if (depth >= 3 && moveCount > 2 && quiet) {
+        r = LMR[Math.min(depth, 63) * 64 + Math.min(moveCount, 63)];
+        if (isPV) r--;
+        if (givesCheck) r--;
+        const side = p.stm > 0 ? 1 : 0;   // mover's side (stm already flipped)
+        if (historyTbl[(side * 64 + mvFrom(m)) * 64 + mvTo(m)] > 8000) r--;
+        if (r < 0) r = 0;
+        if (r > depth - 2) r = depth - 2;
+      }
+
+      // Zero-window probe, re-searched wider only when it beats alpha.
+      score = -negamax(p, depth - 1 - r, -alpha - 1, -alpha, ply + 1, false, true, m);
+      if (!aborted && score > alpha && r > 0) {
+        score = -negamax(p, depth - 1, -alpha - 1, -alpha, ply + 1, false, true, m);
+      }
+      if (!aborted && score > alpha && score < beta) {
+        score = -negamax(p, depth - 1, -beta, -alpha, ply + 1, true, true, m);
+      }
+    }
+
+    p.unmakeMove();
+    if (aborted) return 0;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMove = m;
+      if (score > alpha) {
+        alpha = score;
+        // Record the principal variation for this node.
+        pvTable[ply * MAX_PLY + ply] = m;
+        for (let j = ply + 1; j < pvLength[ply + 1]; j++) {
+          pvTable[ply * MAX_PLY + j] = pvTable[(ply + 1) * MAX_PLY + j];
+        }
+        pvLength[ply] = pvLength[ply + 1];
+
+        if (alpha >= beta) {
+          if (quiet) recordQuiet(p, m, depth, ply, prevMove);
+          break;
+        }
+      }
+    }
+  }
+
+  if (moveCount === 0) return inCheck ? -MATE + ply : 0;   // mate or stalemate
+
+  // Store, preferring deeper entries but always replacing stale generations.
+  if (!aborted && (ttFlag[slot] === 0 || ttAge[slot] !== ttGen || ttDepth[slot] <= depth)) {
+    let s = bestScore;
+    if (s > MATE_BOUND) s += ply;
+    else if (s < -MATE_BOUND) s -= ply;
+    ttKey[slot] = p.keyHi;
+    ttMove[slot] = bestMove;
+    ttScore[slot] = s;
+    ttDepth[slot] = Math.min(depth, 127);
+    ttFlag[slot] = bestScore <= origAlpha ? 3 : bestScore >= beta ? 2 : 1;
+    ttAge[slot] = ttGen;
+  }
+
+  return bestScore;
+}
+
+// ── Iterative deepening ────────────────────────────────────────────────────
+export const searchInfo = { depth: 0, seldepth: 0, nodes: 0, score: 0, pv: [], timeMs: 0 };
+
+/**
+ * Pick a move for the side to move.
+ *
+ * @param {object} state      chess.js-style game state
+ * @param {number} timeLimit  milliseconds of thinking time
+ * @param {boolean} useNN     blend the neural network into leaf scores
+ * @param {object} [opts]     { history: number[] } zobrist keys of earlier game
+ *                            positions, as [lo, hi, lo, hi, …]
+ * @returns {object|null}     a chess.js move object, or null if there is none
+ */
+export function searchBestMove(state, timeLimit, useNN, opts) {
+  const side = state._sideToMove || (state.sideToMove) || 'white';
+  const uiMoves = getLegalMoves(state, side);
+  if (uiMoves.length === 0) return null;
+
+  startTime = Date.now();
+  hardLimit = startTime + Math.max(30, timeLimit * 0.95);
+  const softLimit = startTime + timeLimit * 0.5;
+  aborted = false;
+  nodes = 0;
+  seldepth = 0;
+  useNNFlag = !!useNN;
+  evalCacheFor(useNNFlag);
+  ttGen = (ttGen + 1) & 255;
+
+  killers.fill(0);
+  // History is aged rather than cleared: move quality carries over between
+  // moves, but old data should not outweigh what this search learns.
+  for (let i = 0; i < historyTbl.length; i++) historyTbl[i] >>= 1;
+
+  pos.setFromState(state, side);
+  if (opts && opts.history && opts.history.length) pos.setHistory(opts.history);
+  else pos.setHistory([pos.keyLo, pos.keyHi]);
+
+  // Nothing to think about with a single legal reply.
+  if (uiMoves.length === 1) {
+    searchInfo.depth = 0; searchInfo.nodes = 0; searchInfo.score = 0;
+    searchInfo.pv = []; searchInfo.timeMs = 0; searchInfo.seldepth = 0;
+    return uiMoves[0];
+  }
+
+  let bestMove = NO_MOVE;
+  let bestScore = 0;
+  let lastCompletedDepth = 0;
+
+  // Never let a stale principal variation from the previous search leak out.
+  pvLength.fill(0);
+  pvTable[0] = NO_MOVE;
+
+  for (let depth = 1; depth <= MAX_DEPTH; depth++) {
+    let score;
+    // Aspiration windows: assume the score moved little since the last
+    // iteration and re-search wider only when that assumption fails.
+    if (depth <= 4) {
+      score = negamax(pos, depth, -INF, INF, 0, true, true, NO_MOVE);
+    } else {
+      let delta = 25;
+      let alpha = Math.max(-INF, bestScore - delta);
+      let beta  = Math.min(INF, bestScore + delta);
+      while (true) {
+        score = negamax(pos, depth, alpha, beta, 0, true, true, NO_MOVE);
+        if (aborted) break;
+        if (score <= alpha)      { beta = (alpha + beta) >> 1; alpha = Math.max(-INF, alpha - delta); }
+        else if (score >= beta)  { beta = Math.min(INF, beta + delta); }
+        else break;
+        delta += delta >> 1;
+        if (delta > 1200) { alpha = -INF; beta = INF; }
+      }
     }
 
     if (aborted) break;
+    if (pvLength[0] === 0) break;          // terminal root — no move to make
 
-    if (maximize) {
-      if (score > bestScore) { bestScore = score; bestMove = mv; }
-      if (score > alpha) alpha = score;
-    } else {
-      if (score < bestScore) { bestScore = score; bestMove = mv; }
-      if (score < beta) beta = score;
-    }
+    bestMove = pvTable[0];
+    bestScore = score;
+    lastCompletedDepth = depth;
+    searchInfo.depth = depth;
+    searchInfo.seldepth = seldepth;
+    searchInfo.nodes = nodes;
+    searchInfo.score = score;
+    searchInfo.pv = readPV();
+    searchInfo.timeMs = Date.now() - startTime;
 
-    if (alpha >= beta) {
-      // Beta cutoff — record in heuristic tables
-      if (!isCapOrPromo) {
-        addKiller(mv, ply);
-        addHistory(mv, depth);
-      }
-      break;
-    }
+    if (Math.abs(score) > MATE_BOUND) break;          // forced mate found
+    if (Date.now() >= softLimit) break;               // no time for another pass
   }
 
-  // Store result in TT
-  if (!aborted) {
-    ttKeyLo[idx] = lo; ttKeyHi[idx] = hi;
-    ttScore[idx] = bestScore; ttDepth[idx] = Math.min(depth, 255);
-    ttMoves[idx] = bestMove;
-    ttFlag[idx] = bestScore <= origAlpha ? 2 : bestScore >= origBeta ? 1 : 0;
+  // Fall back to the table move if the very first iteration was cut short.
+  if (bestMove === NO_MOVE) {
+    const slot = pos.keyLo & TT_MASK;
+    if (ttFlag[slot] !== 0 && ttKey[slot] === pos.keyHi) bestMove = ttMove[slot];
   }
+  if (bestMove === NO_MOVE) return uiMoves[0];
 
-  return [bestMove, bestScore];
+  searchInfo.depth = lastCompletedDepth;
+  const ui = matchUIMove(bestMove, uiMoves);
+  return ui || uiMoves[0];
 }
 
-// ── Iterative Deepening ────────────────────────────────────────────────────
-export function searchBestMove(state, timeLimit, useNN) {
-  startTime   = Date.now();
-  timeLimitMs = timeLimit;
-  aborted     = false;
-  nodeCount   = 0;
+function readPV() {
+  const out = [];
+  for (let i = 0; i < pvLength[0] && i < 32; i++) {
+    const m = pvTable[i];
+    if (m === NO_MOVE) break;
+    out.push(moveToString(m));
+  }
+  return out;
+}
 
-  // Reset per-search heuristics (keep history across moves — it's global knowledge)
-  for (let i = 0; i < MAX_PLY; i++) { killers[i][0] = null; killers[i][1] = null; }
+export function moveToString(m) {
+  const f = mvFrom(m), t = mvTo(m);
+  const s = (sq) => String.fromCharCode(97 + (sq & 7)) + (8 - (sq >> 3));
+  return s(f) + s(t) + (mvPromo(m) ? 'nbrq'[mvPromo(m) - 2] : '');
+}
 
-  const side = state._sideToMove || 'black';
-  const [lo, hi] = computeZobrist(state);
-  let bestMove = null;
-  let prevScore = 0;
+// Scratch position used only for hashing and one-off evaluation, kept apart
+// from the search's own.
+const keyScratch = new Position();
 
-  // Aspiration window parameters
-  const ASP_DELTA = 50;
+/**
+ * Static evaluation of a game position in centipawns, White-positive — the same
+ * leaf score the search uses, so the evaluation bar and the engine cannot
+ * disagree about what a position is worth.
+ */
+export function staticEvalOf(state, side, useNN) {
+  keyScratch.setFromState(state, side);
+  const prev = useNNFlag;
+  useNNFlag = !!useNN;
+  evalCacheFor(useNNFlag);
+  const v = evalLeaf(keyScratch);
+  useNNFlag = prev;
+  evalCacheFor(prev);
+  return keyScratch.stm > 0 ? v : -v;
+}
 
-  for (let depth = 1; depth <= MAX_DEPTH; depth++) {
-    aborted = false;
+/**
+ * Zobrist key of a game position, as [lo, hi]. Callers record one of these per
+ * played position and hand the list back through searchBestMove's `history`,
+ * which is what lets the search see a repetition coming.
+ */
+export function zobristOf(state, side) {
+  keyScratch.setFromState(state, side);
+  return [keyScratch.keyLo, keyScratch.keyHi];
+}
 
-    // Aspiration windows: start with narrow window, widen on fail
-    let alpha, beta;
-    if (depth <= 4) {
-      // Full window for first few depths (too shallow for aspiration)
-      alpha = -Infinity; beta = Infinity;
-    } else {
-      alpha = prevScore - ASP_DELTA;
-      beta  = prevScore + ASP_DELTA;
-    }
+/** Wipe all learned state — used between games so nothing leaks across. */
+export function resetEngine() {
+  ttClear();
+  evOk.fill(0);
+  evCachedWithNN = null;
+  historyTbl.fill(0);
+  counterTbl.fill(0);
+  killers.fill(0);
+  ttGen = 0;
+}
 
-    let mv, score;
-    let aspirationFailed = false;
+/** Search a Position directly. Used by the test harnesses. */
+export function searchPosition(position, timeLimit, useNN) {
+  startTime = Date.now();
+  hardLimit = startTime + timeLimit;
+  const softLimit = startTime + timeLimit * 0.5;
+  aborted = false; nodes = 0; seldepth = 0; useNNFlag = !!useNN;
+  evalCacheFor(useNNFlag);
+  ttGen = (ttGen + 1) & 255;
+  killers.fill(0);
 
-    while (true) {
-      aborted = false;
-      [mv, score] = search(state, lo, hi, depth, alpha, beta, side, 0, useNN, false);
+  const p = position;
+  if (p.histN === 0) p.setHistory([p.keyLo, p.keyHi]);
 
-      if (aborted) { aspirationFailed = true; break; }
-
-      if (score <= alpha) {
-        // Fail low — widen window down
-        alpha = Math.max(alpha - ASP_DELTA * 4, -Infinity);
-      } else if (score >= beta) {
-        // Fail high — widen window up
-        beta = Math.min(beta + ASP_DELTA * 4, Infinity);
-      } else {
-        break; // Within window — search is reliable
-      }
-    }
-
-    if (!aspirationFailed && mv) {
-      bestMove = mv;
-      prevScore = score;
-    }
-
-    // Stop if we've found a forced mate
-    if (Math.abs(score) >= MATE_SCORE - 100) break;
-
-    // Time management: don't start the next iteration if we've used ≥ 55% of the
-    // budget, since each deeper iteration typically costs 3–5× the previous one.
-    const elapsed = Date.now() - startTime;
-    if (elapsed >= timeLimitMs * 0.55) break;
+  // A mated or stalemated root has nothing to return.
+  const n0 = p.generate(p.ply, false);
+  let anyLegal = false;
+  for (let i = 0; i < n0; i++) {
+    if (p.makeMove(p.moveBuf[p.ply * 256 + i])) { p.unmakeMove(); anyLegal = true; break; }
+  }
+  if (!anyLegal) {
+    searchInfo.depth = 0; searchInfo.nodes = 0; searchInfo.pv = [];
+    searchInfo.score = p.inCheck() ? -MATE : 0;
+    return NO_MOVE;
   }
 
-  return bestMove;
+  pvLength.fill(0);
+  pvTable[0] = NO_MOVE;
+
+  let best = NO_MOVE, bestScore = 0;
+  for (let depth = 1; depth <= MAX_DEPTH; depth++) {
+    let score;
+    if (depth <= 4) {
+      score = negamax(p, depth, -INF, INF, 0, true, true, NO_MOVE);
+    } else {
+      let delta = 25;
+      let alpha = Math.max(-INF, bestScore - delta), beta = Math.min(INF, bestScore + delta);
+      while (true) {
+        score = negamax(p, depth, alpha, beta, 0, true, true, NO_MOVE);
+        if (aborted) break;
+        if (score <= alpha)     { beta = (alpha + beta) >> 1; alpha = Math.max(-INF, alpha - delta); }
+        else if (score >= beta) { beta = Math.min(INF, beta + delta); }
+        else break;
+        delta += delta >> 1;
+        if (delta > 1200) { alpha = -INF; beta = INF; }
+      }
+    }
+    if (aborted) break;
+    if (pvLength[0] === 0) break;
+    best = pvTable[0];
+    bestScore = score;
+    searchInfo.depth = depth; searchInfo.seldepth = seldepth; searchInfo.nodes = nodes;
+    searchInfo.score = score; searchInfo.pv = readPV(); searchInfo.timeMs = Date.now() - startTime;
+    if (Math.abs(score) > MATE_BOUND) break;
+    if (Date.now() >= softLimit) break;
+  }
+  return best;
 }

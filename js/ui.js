@@ -3,10 +3,10 @@
 
 import {
   initState, makeMove, getLegalMoves, getGameStatus,
-  isInCheck, PIECE_GLYPHS, opposite, evaluatePosition, positionKey
+  isInCheck, PIECE_GLYPHS, opposite, positionKey
 } from './chess.js';
-import { loadModel, isReady as nnIsReady, evaluate, lastError as nnError } from './neural.js';
-import { searchBestMove } from './engine.js';
+import { loadModel, isReady as nnIsReady, lastError as nnError } from './neural.js';
+import { searchBestMove, resetEngine, zobristOf, staticEvalOf } from './engine.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let gameState     = null;
@@ -16,13 +16,32 @@ let legalMoves    = [];
 let selectedSq    = null;
 let selectedLegal = [];
 let thinkTimeMs   = 5000;
-let useNN         = true;
+let useNN         = false;   // off by default — see the note in js/engine.js
 let gameOver      = false;
 let sideToMove    = 'white';
 let aiThinking    = false;
 let boardFlipped  = false; // true when playing as Black (board rotated 180°)
 let posCounts     = new Map(); // position key → occurrences, for threefold repetition
 let gameId        = 0;         // bumped per game so stale search results are ignored
+
+// Zobrist keys of every position played, as [lo, hi, lo, hi, …]. The engine
+// needs these to see that a line would repeat a position from earlier in the
+// real game, not just within its own search.
+let zobristKeys   = [];
+
+// Score the engine reported for its own move, in centipawns from its point of
+// view. A searched score is a far better reading than a static one, so the
+// evaluation bar prefers it while it is current.
+let searchedEval  = null;
+
+// ── Learning mode ──────────────────────────────────────────────────────────
+// With learning mode on the player gets one take-back at a time: the button
+// rewinds their last move together with the AI's reply, and then stays disabled
+// until they have played again. That makes it a way to explore an alternative
+// after seeing the refutation, rather than a way to rewind the whole game.
+let learningMode  = false;
+let takebackUsed  = false;
+let history       = [];   // snapshot taken before each move
 
 // ── DOM References ─────────────────────────────────────────────────────────
 const boardEl     = document.getElementById('board');
@@ -32,7 +51,9 @@ const promoModal  = document.getElementById('promo-modal');
 const promoChoices = document.getElementById('promo-choices');
 const thinkingEl  = document.getElementById('thinking-overlay');
 const newGameBtn  = document.getElementById('new-game-btn');
+const takebackBtn = document.getElementById('takeback-btn');
 const nnCb        = document.getElementById('nn-cb');
+const learnCb     = document.getElementById('learn-cb');
 const evalFillEl  = document.getElementById('eval-white-fill');
 const evalTextEl  = document.getElementById('eval-text');
 
@@ -50,7 +71,7 @@ try {
     const msg = e.data;
     if (msg.type === 'result') {
       const resolve = pendingSearches.get(msg.id);
-      if (resolve) { pendingSearches.delete(msg.id); resolve(msg.move); }
+      if (resolve) { pendingSearches.delete(msg.id); resolve(msg); }
     }
   };
   worker.onerror = () => { worker = null; };   // fall back to main thread
@@ -58,18 +79,28 @@ try {
   worker = null;
 }
 
-// Resolves to the chosen move, searching off-thread when possible.
-function findBestMove(state, timeLimit, withNN) {
+// Resolves to {move, info}, searching off-thread when possible.
+function findBestMove(state, timeLimit, withNN, historyKeys) {
   if (worker) {
     return new Promise(resolve => {
       const id = ++workerReqId;
       pendingSearches.set(id, resolve);
-      worker.postMessage({ type: 'search', id, state, timeLimit, useNN: withNN });
+      worker.postMessage({
+        type: 'search', id, state, timeLimit, useNN: withNN, history: historyKeys,
+      });
     });
   }
   return new Promise(resolve => {
-    setTimeout(() => resolve(searchBestMove(state, timeLimit, withNN)), 20);
+    setTimeout(() => {
+      const move = searchBestMove(state, timeLimit, withNN, { history: historyKeys });
+      resolve({ move, info: null });
+    }, 20);
   });
+}
+
+function resetSearchState() {
+  if (worker) worker.postMessage({ type: 'reset' });
+  else resetEngine();
 }
 
 // ── Neural Network Initialization ──────────────────────────────────────────
@@ -80,7 +111,10 @@ function findBestMove(state, timeLimit, withNN) {
   try {
     await loadModel();
     if (nnIsReady()) {
+      // Available to switch on, but left off: it measured weaker than the hand
+      // evaluation, so the default is the engine's strongest setting.
       nnCb.disabled = false;
+      useNN = nnCb.checked;
       updateEvalBar();
       if (!aiThinking && !gameOver) setStatus(`${cap(sideToMove)} to move`);
     } else {
@@ -198,14 +232,21 @@ function renderCaptured() {
 
 // ── Evaluation Bar ─────────────────────────────────────────────────────────
 // whiteAdv: positive = White is winning (pawn units).
-// NN (neural.js) returns white-perspective; evaluatePosition is black-perspective in centipawns.
 function updateEvalBar() {
   if (!gameState || !evalFillEl || !evalTextEl) return;
   let whiteAdv = 0;
-  try {
-    const nn = useNN && nnIsReady() ? evaluate(gameState.board) : null;
-    whiteAdv = nn !== null ? nn : -evaluatePosition(gameState) / 100;
-  } catch (_) {}
+
+  if (searchedEval !== null) {
+    // The engine's own score for the move it just chose, seen from White. A
+    // searched score is a much better reading than a static one.
+    whiteAdv = (aiSide === 'white' ? searchedEval : -searchedEval) / 100;
+  } else {
+    try {
+      // Otherwise the engine's own leaf evaluation, so the bar and the engine
+      // never disagree about what the position is worth.
+      whiteAdv = staticEvalOf(gameState, sideToMove, useNN && nnIsReady()) / 100;
+    } catch (_) {}
+  }
 
   // Lichess-style sigmoid: 50% at 0, ~88% at ±4 pawns
   const prob = 1 / (1 + Math.exp(-whiteAdv / 4));
@@ -278,16 +319,25 @@ function handleSquareTap(r, c) {
 
 // ── Move Application ───────────────────────────────────────────────────────
 function applyMove(mv, bySide) {
+  history.push(snapshot());
+
   gameState = makeMove(gameState, mv);
   gameState._sideToMove = opposite(bySide);
   sideToMove = opposite(bySide);
   selectedSq = null; selectedLegal = [];
   recordPosition();
 
+  // The player has committed to a move, so the take-back is available again.
+  if (bySide === humanSide) {
+    takebackUsed = false;
+    searchedEval = null;
+  }
+
   renderBoard();
   renderCaptured();
   updateStatus();
   updateEvalBar();
+  updateTakebackBtn();
 
   if (!gameOver) {
     legalMoves = getLegalMoves(gameState, sideToMove);
@@ -299,10 +349,76 @@ function applyMove(mv, bySide) {
 function recordPosition() {
   const k = positionKey(gameState, sideToMove);
   posCounts.set(k, (posCounts.get(k) || 0) + 1);
+  const [lo, hi] = zobristOf(gameState, sideToMove);
+  zobristKeys.push(lo, hi);
 }
 
 function currentRepCount() {
   return posCounts.get(positionKey(gameState, sideToMove)) || 1;
+}
+
+// ── History / Take Back ────────────────────────────────────────────────────
+function snapshot() {
+  return {
+    state: JSON.parse(JSON.stringify(gameState)),
+    sideToMove,
+    gameOver,
+    posCounts: new Map(posCounts),
+    zobristKeys: zobristKeys.slice(),
+    searchedEval,
+  };
+}
+
+function restore(snap) {
+  gameState = JSON.parse(JSON.stringify(snap.state));
+  gameState._sideToMove = snap.sideToMove;
+  sideToMove   = snap.sideToMove;
+  gameOver     = snap.gameOver;
+  posCounts    = new Map(snap.posCounts);
+  zobristKeys  = snap.zobristKeys.slice();
+  searchedEval = snap.searchedEval;
+  selectedSq   = null;
+  selectedLegal = [];
+  legalMoves   = getLegalMoves(gameState, sideToMove);
+}
+
+// Index of the most recent position where it was the player's turn.
+function lastHumanTurnIndex() {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].sideToMove === humanSide) return i;
+  }
+  return -1;
+}
+
+function canTakeBack() {
+  return learningMode && !takebackUsed && lastHumanTurnIndex() >= 0;
+}
+
+function takeBack() {
+  if (!canTakeBack()) return;
+  const idx = lastHumanTurnIndex();
+
+  // Invalidate any search still running: its answer is for a position that is
+  // about to stop existing.
+  gameId++;
+  aiThinking = false;
+  hideThinking();
+
+  const snap = history[idx];
+  history.length = idx;
+  restore(snap);
+  takebackUsed = true;
+
+  renderBoard();
+  renderCaptured();
+  updateStatus();
+  updateEvalBar();
+  updateTakebackBtn();
+}
+
+function updateTakebackBtn() {
+  takebackBtn.disabled = !canTakeBack();
+  takebackBtn.textContent = learningMode && takebackUsed ? 'Take Back ✓' : 'Take Back';
 }
 
 // ── AI ─────────────────────────────────────────────────────────────────────
@@ -311,11 +427,12 @@ function requestAIMove() {
   showThinking();
 
   const snap    = JSON.parse(JSON.stringify(gameState));
+  const keys    = zobristKeys.slice();
   const forSide = aiSide;
   const forGame = gameId;
 
-  findBestMove(snap, thinkTimeMs, useNN && nnIsReady()).then(best => {
-    // Discard results from a game that has since been restarted.
+  findBestMove(snap, thinkTimeMs, useNN && nnIsReady(), keys).then(res => {
+    // Discard results from a game or position that has since moved on.
     if (forGame !== gameId) return;
 
     aiThinking = false;
@@ -323,7 +440,10 @@ function requestAIMove() {
 
     if (gameOver || sideToMove !== forSide) return;
 
+    const best = res && res.move;
     if (!best) { setStatus('AI has no legal move!'); return; }
+
+    searchedEval = res.info && typeof res.info.score === 'number' ? res.info.score : null;
     applyMove(best, forSide);
   });
 }
@@ -339,6 +459,7 @@ function updateStatus() {
     else                                 setStatus(`Draw — ${st.reason}.`, 'draw');
     return;
   }
+  gameOver = false;
   if (isInCheck(gameState, sideToMove)) {
     setStatus(`${cap(sideToMove)} to move — Check!`, 'check');
   } else {
@@ -398,23 +519,36 @@ function selectColor(side) {
   startNewGame(side);
 }
 
-playWhiteBtn.addEventListener('click', () => selectColor('white'));
-playBlackBtn.addEventListener('click', () => selectColor('black'));
-playWhiteBtn.addEventListener('touchstart', e => { e.preventDefault(); selectColor('white'); }, { passive: false });
-playBlackBtn.addEventListener('touchstart', e => { e.preventDefault(); selectColor('black'); }, { passive: false });
+// Taps are bound for both mouse and touch; touchstart is intercepted so iOS
+// does not wait for its click delay.
+function bindTap(el, fn) {
+  el.addEventListener('click', fn);
+  el.addEventListener('touchstart', e => { e.preventDefault(); fn(); }, { passive: false });
+}
 
-newGameBtn.addEventListener('click', () => startNewGame(humanSide));
-newGameBtn.addEventListener('touchstart', e => { e.preventDefault(); newGameBtn.click(); }, { passive: false });
+bindTap(playWhiteBtn, () => selectColor('white'));
+bindTap(playBlackBtn, () => selectColor('black'));
+bindTap(newGameBtn,   () => startNewGame(humanSide));
+bindTap(takebackBtn,  () => takeBack());
 
-nnCb.addEventListener('change', () => { useNN = nnCb.checked; });
+nnCb.addEventListener('change', () => {
+  useNN = nnCb.checked;
+  searchedEval = null;
+  updateEvalBar();
+});
+
+learnCb.addEventListener('change', () => {
+  learningMode = learnCb.checked;
+  learnCb.parentElement.classList.toggle('on', learningMode);
+  updateTakebackBtn();
+});
 
 document.querySelectorAll('[data-time]').forEach(btn => {
-  btn.addEventListener('click', () => {
+  bindTap(btn, () => {
     document.querySelectorAll('[data-time]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     thinkTimeMs = parseInt(btn.dataset.time, 10);
   });
-  btn.addEventListener('touchstart', e => { e.preventDefault(); btn.click(); }, { passive: false });
 });
 
 // ── Initialization ─────────────────────────────────────────────────────────
@@ -422,6 +556,7 @@ function startNewGame(chosenHumanSide = humanSide) {
   gameId++;            // invalidates any search still running for the old game
   aiThinking   = false;
   hideThinking();
+  resetSearchState();  // no knowledge carries over between games
   humanSide    = chosenHumanSide;
   aiSide       = opposite(chosenHumanSide);
   boardFlipped = humanSide === 'black'; // rotate board so player's pieces are always at bottom
@@ -432,12 +567,17 @@ function startNewGame(chosenHumanSide = humanSide) {
   selectedSq   = null;
   selectedLegal = [];
   posCounts    = new Map();
+  zobristKeys  = [];
+  history      = [];
+  takebackUsed = false;
+  searchedEval = null;
   recordPosition();
   legalMoves   = getLegalMoves(gameState, 'white');
   buildBoard();     // rebuild grid with correct orientation
   renderBoard();
   renderCaptured();
   updateEvalBar();
+  updateTakebackBtn();
   setStatus('White to move');
   if (aiSide === 'white') requestAIMove(); // AI goes first when playing as Black
 }

@@ -1,14 +1,17 @@
 // Bump on every release — a stale cache would keep serving the old JS/model.
-const CACHE = 'chess-v3';
+const CACHE = 'chess-v4';
+
+// Everything needed to play a full game with no network at all.
 const ASSETS = [
   '/',
   '/index.html',
   '/manifest.json',
   '/css/style.css',
   '/js/chess.js',
+  '/js/position.js',
+  '/js/evaluate.js',
   '/js/engine.js',
   '/js/neural.js',
-  '/js/pgn.js',
   '/js/ui.js',
   '/js/worker.js',
   '/icons/icon-192.png',
@@ -26,11 +29,16 @@ const MODEL_ASSETS = [
 self.addEventListener('install', (e) => {
   e.waitUntil(
     caches.open(CACHE).then(async cache => {
-      await cache.addAll(ASSETS);
-      // Model files are optional — don't fail install if missing
-      await Promise.allSettled(MODEL_ASSETS.map(url =>
-        fetch(url).then(r => r.ok ? cache.put(url, r) : null).catch(() => null)
-      ));
+      // Cached one at a time rather than with addAll: addAll rejects the whole
+      // install if any single entry fails, which would leave the app with no
+      // service worker at all rather than a nearly complete cache.
+      const results = await Promise.allSettled(
+        [...ASSETS, ...MODEL_ASSETS].map(url => cache.add(url))
+      );
+      const failed = results
+        .map((r, i) => (r.status === 'rejected' ? [...ASSETS, ...MODEL_ASSETS][i] : null))
+        .filter(Boolean);
+      if (failed.length) console.warn('[sw] not cached:', failed.join(', '));
     })
   );
   self.skipWaiting();

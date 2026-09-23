@@ -55,15 +55,26 @@
 
     <div class="btn-row">
       <button class="ctrl-btn" id="new-game-btn">New Game</button>
+      <!-- Enabled only in learning mode, and only once per move -->
+      <button class="ctrl-btn" id="takeback-btn" disabled
+              title="Learning mode only: undo your last move and the engine's reply. One take-back per move.">Take Back</button>
     </div>
 
-    <label id="nn-toggle">
-      <input type="checkbox" id="nn-cb" checked>
-      Neural Net evaluation
-    </label>
+    <div class="toggle-row">
+      <!-- Off by default: measured ~65 Elo weaker than the hand evaluation
+           alone (see the note in js/engine.js). -->
+      <label class="toggle" title="Add the master-game network's positional judgement to the evaluation. Measured about 65 Elo WEAKER than the hand evaluation alone, so it is off by default.">
+        <input type="checkbox" id="nn-cb">
+        Neural Net
+      </label>
+      <label class="toggle" title="Allow one take-back at a time, so you can try a different move after seeing the refutation">
+        <input type="checkbox" id="learn-cb">
+        Learning mode
+      </label>
+    </div>
 
     <div id="footer">
-      <div id="version">v1.0</div>
+      <div id="version">v2.0</div>
       <div id="credit">credit: igeru</div>
     </div>
   </div>

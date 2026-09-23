@@ -1,8 +1,8 @@
 {
   "name": "chess-nn-trainer",
-  "version": "1.0.0",
-  "description": "Train the ChessNN neural network on PGN game files",
-  "type": "commonjs",
+  "version": "2.0.0",
+  "description": "Train the ChessNN evaluation network from scratch on the repository's master PGN files",
+  "type": "module",
   "scripts": {
     "train": "node train.js"
   },

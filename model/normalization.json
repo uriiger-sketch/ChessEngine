@@ -1,6 +1,18 @@
 {
-  "xMin": 0,
-  "xMax": 1,
-  "yMin": -10,
-  "yMax": 10
+  "output": "residual",
+  "inputs": 773,
+  "cpScale": 175,
+  "clampCp": 200,
+  "trainedOn": [
+    "1Carlsen.pgn",
+    "2Caruana.pgn",
+    "3Fischer.pgn",
+    "4Capablanca.pgn",
+    "5Kasparov.pgn",
+    "6Nakamura.pgn",
+    "7Tal.pgn"
+  ],
+  "positions": 891863,
+  "valLoss": 0.63448,
+  "materialOnlyLoss": 0.65697
 }
