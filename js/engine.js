@@ -28,7 +28,7 @@ import {
   matchUIMove, NO_MOVE
 } from './position.js';
 import { evaluate as handEvaluate } from './evaluate.js';
-import { getLegalMoves } from './chess.js';
+import { getLegalMoves, makeMove } from './chess.js';
 import { evaluate as nnEvaluate, isReady as nnIsReady, isResidual as nnIsResidual } from './neural.js';
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -657,6 +657,233 @@ export function searchTopMoves(state, bestMs, count, useNN, opts = {}) {
     rootExclude = null;
   }
   return found;
+}
+
+// ── Continuous analysis (Help mode) ────────────────────────────────────────
+//
+// Help mode's suggestions come from a long-lived analysis rather than a
+// one-off timed search. An analysis owns one root position and deepens it in
+// short steps for as long as it is wanted: on the player's turn it keeps going
+// while they think, and during the engine's turn the page points it at the
+// position after the engine's expected reply — pondering — so that when the
+// reply comes, the analysis is usually already deep. Nothing is thrown away
+// between steps: the transposition table, the history heuristic and the root
+// move order all carry over, and each step resumes at the next depth.
+//
+// The top moves are ranked in ONE search (multi-PV): at the root the first
+// `count` moves get full windows and exact scores, and every later move is
+// only tested against the current count-th best with a null window. That is
+// far cheaper than the separate "search, exclude the best, search again"
+// passes it replaces, and all the scores come from the same depth, so they
+// rank consistently.
+
+/** Start analysing a position. Returns a handle for analyseStep(). */
+export function createAnalysis(state, count, useNN, history) {
+  const side = state._sideToMove || state.sideToMove || 'white';
+  const snap = JSON.parse(JSON.stringify(state));
+  snap._sideToMove = side;
+  const a = {
+    state: snap, side, useNN: !!useNN,
+    history: history && history.length ? history.slice() : null,
+    uiMoves: getLegalMoves(snap, side),
+    key: null, depth: 0, lines: [], rootMoves: [], count: 0,
+    nodes: 0, elapsed: 0, done: false,
+  };
+  a.count = Math.min(count, a.uiMoves.length);
+
+  loadRoot(snap, side, { history: a.history });
+  a.key = [pos.keyLo, pos.keyHi];
+
+  const n = pos.generate(0, false);
+  for (let i = 0; i < n; i++) {
+    const m = pos.moveBuf[i];
+    if (!pos.makeMove(m)) continue;
+    pos.unmakeMove();
+    a.rootMoves.push({ move: m, score: -INF, pv: [m] });
+  }
+  if (a.count === 0) a.done = true;
+
+  // A fresh root: new table generation and killers, history aged not cleared.
+  ttGen = (ttGen + 1) & 255;
+  killers.fill(0);
+  for (let i = 0; i < historyTbl.length; i++) historyTbl[i] >>= 1;
+  return a;
+}
+
+/** True when `a` is analysing the position given by `state`. */
+export function analysisMatches(a, state) {
+  if (!a) return false;
+  const side = state._sideToMove || state.sideToMove || 'white';
+  const [lo, hi] = zobristOf(state, side);
+  return a.key[0] === lo && a.key[1] === hi;
+}
+
+// Timers only — unlike beginSearch() this keeps the table generation, killers
+// and history, because the next step continues the same analysis.
+function beginSlice(ms, useNN) {
+  startTime = Date.now();
+  hardLimit = startTime + Math.max(20, ms);
+  aborted = false;
+  nodes = 0;
+  seldepth = 0;
+  useNNFlag = !!useNN;
+  evalCacheFor(useNNFlag);
+}
+
+// One analysis iteration at `depth`. Returns false if time ran out before the
+// best move was settled, in which case the previous iteration's answer stands.
+//
+// The best move gets the full depth: an ordinary principal-variation search
+// at the root, where every other move only has to prove, with a null window,
+// that it is no better — late quiet ones first at reduced depth. That is the
+// move the player acts on, so it is where the time goes.
+//
+// The alternatives are then ranked with exact scores two plies shallower,
+// which costs about a ninth as much. They cannot contradict the best move:
+// the full-depth pass has already shown each of them scores no higher, so a
+// shallower score above it is noise and is capped at the best move's score.
+function rootIteration(a, depth) {
+  const moves = a.rootMoves;
+  let alpha = -INF;
+  let bestIdx = -1;
+
+  for (let i = 0; i < moves.length; i++) {
+    const rm = moves[i];
+    const m = rm.move;
+    if (!pos.makeMove(m)) continue;
+
+    let score;
+    if (i === 0) {
+      const prev = rm.score;
+      if (depth >= 4 && prev > -MATE_BOUND && prev < MATE_BOUND) {
+        let delta = 25, lo = prev - delta, hi = prev + delta;
+        while (true) {
+          score = -negamax(pos, depth - 1, -hi, -lo, 1, true, true, m);
+          if (aborted) break;
+          if (score <= lo)      lo = Math.max(-INF, lo - delta);
+          else if (score >= hi) hi = Math.min(INF, hi + delta);
+          else break;
+          delta *= 2;
+          if (delta > 800) { lo = -INF; hi = INF; }
+        }
+      } else {
+        score = -negamax(pos, depth - 1, -INF, INF, 1, true, true, m);
+      }
+    } else {
+      let r = 0;
+      if (depth >= 3 && i >= 3 && mvIsQuiet(m) && !pos.inCheck()) {
+        r = LMR[Math.min(depth, 63) * 64 + Math.min(i, 63)];
+        if (r > depth - 2) r = depth - 2;
+        if (r < 0) r = 0;
+      }
+      score = -negamax(pos, depth - 1 - r, -alpha - 1, -alpha, 1, false, true, m);
+      if (!aborted && r > 0 && score > alpha) {
+        score = -negamax(pos, depth - 1, -alpha - 1, -alpha, 1, false, true, m);
+      }
+      if (!aborted && score > alpha) {
+        score = -negamax(pos, depth - 1, -INF, -alpha, 1, true, true, m);
+      }
+    }
+    pos.unmakeMove();
+    if (aborted) return false;
+
+    rm.bound = score;                       // exact for the best, an upper bound otherwise
+    if (score > alpha) {
+      alpha = score;
+      bestIdx = i;
+      rm.pv = [m];
+      for (let j = 1; j < pvLength[1]; j++) rm.pv.push(pvTable[MAX_PLY + j]);
+    }
+  }
+  if (bestIdx < 0) return false;
+
+  // Settle the best move at the front.
+  const best = moves.splice(bestIdx, 1)[0];
+  best.score = alpha;
+  moves.unshift(best);
+
+  // Alternatives: exact scores at depth-2 for the most promising few.
+  // At low depths every search is cheap and two plies shallower is too shallow
+  // to mean anything, so the reduction only starts once there is depth to spare.
+  const altDepth = Math.max(depth - 2, Math.min(depth, 5));
+  const want = a.count - 1;
+  if (want > 0) {
+    const rest = moves.slice(1).sort((x, y) => (y.alt ?? y.bound) - (x.alt ?? x.bound));
+    const check = rest.slice(0, want + 2);
+    for (const rm of check) {
+      if (!pos.makeMove(rm.move)) continue;
+      const sc = -negamax(pos, altDepth - 1, -INF, INF, 1, true, true, rm.move);
+      pos.unmakeMove();
+      if (aborted) break;                   // keep the alternatives we already had
+      rm.alt = Math.min(sc, alpha);
+      rm.altDepth = altDepth;
+      rm.pv = [rm.move];
+      for (let j = 1; j < pvLength[1]; j++) rm.pv.push(pvTable[MAX_PLY + j]);
+    }
+    aborted = false;                        // the best move for this depth is settled
+    rest.sort((x, y) => (y.alt ?? -INF) - (x.alt ?? -INF));
+    moves.length = 1;
+    for (const rm of rest) moves.push(rm);
+  }
+  return true;
+}
+
+/**
+ * Deepen an analysis for up to `ms` milliseconds. Returns true if at least
+ * one more depth was completed (and so `a.lines` changed).
+ */
+export function analyseStep(a, ms) {
+  if (a.done) return false;
+  loadRoot(a.state, a.side, { history: a.history });
+  beginSlice(ms, a.useNN);
+
+  let improved = false;
+  while (!a.done && Date.now() < hardLimit) {
+    const d = a.depth + 1;
+    if (!rootIteration(a, d)) break;
+    a.depth = d;
+    improved = true;
+
+    a.lines = a.rootMoves.slice(0, a.count).map((rm, i) => {
+      const sc = i === 0 ? rm.score : (rm.alt ?? rm.bound);
+      return { move: matchUIMove(rm.move, a.uiMoves), score: sc, mateIn: mateIn(sc),
+               pv: rm.pv.slice(0, 8) };
+    });
+
+    const best = a.rootMoves[0].score;
+    const mateDone = Math.abs(best) > MATE_BOUND && d >= MATE - Math.abs(best) + 2;
+    if (mateDone || d >= MAX_DEPTH - 2 || a.uiMoves.length === 1) a.done = true;
+  }
+  a.nodes += nodes;
+  a.elapsed += Date.now() - startTime;
+  return improved;
+}
+
+/**
+ * The position after the analysed player's move and the engine's expected
+ * reply — what to ponder on during the engine's turn. `playedMove` is the
+ * player's move as a chess.js object. Returns {state, reply} or null when the
+ * analysis has no confident line through that move.
+ */
+export function expectedReply(a, playedMove) {
+  if (!a || !a.lines.length) return null;
+  const line = a.rootMoves.find(rm => {
+    const ui = matchUIMove(rm.move, a.uiMoves);
+    return ui && ui.from[0] === playedMove.from[0] && ui.from[1] === playedMove.from[1] &&
+           ui.to[0] === playedMove.to[0] && ui.to[1] === playedMove.to[1] &&
+           !!ui.promotion === !!playedMove.promotion &&
+           (!ui.promotion || ui.piece === playedMove.piece);
+  });
+  if (!line || line.pv.length < 2) return null;
+
+  const after = makeMove(a.state, playedMove);
+  const them = a.side === 'white' ? 'black' : 'white';
+  after._sideToMove = them;
+  const reply = matchUIMove(line.pv[1], getLegalMoves(after, them));
+  if (!reply) return null;
+  const next = makeMove(after, reply);
+  next._sideToMove = a.side;
+  return { state: next, reply };
 }
 
 function readPV() {

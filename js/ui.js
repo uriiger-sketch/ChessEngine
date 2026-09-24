@@ -6,7 +6,7 @@ import {
   isInCheck, PIECE_GLYPHS, opposite, positionKey
 } from './chess.js';
 import { loadModel, isReady as nnIsReady, lastError as nnError } from './neural.js';
-import { searchBestMove, searchTopMoves, resetEngine, zobristOf, staticEvalOf } from './engine.js';
+import { searchBestMove, createAnalysis, analyseStep, resetEngine, zobristOf, staticEvalOf } from './engine.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let gameState     = null;
@@ -45,23 +45,26 @@ const MODES = ['play', 'learn', 'help'];
 const MODE_CAPTIONS = {
   play:  'Just you and the engine.',
   learn: 'Back returns you to the start of your last turn.',
-  help:  'Your three best moves are shown each turn. Back is available too.',
+  help:  'Your three best moves — they get stronger the longer you think.',
 };
 let mode          = loadMode();
 let backUsed      = false;
 let history       = [];   // snapshot taken before each move
 
 // ── Help mode state ────────────────────────────────────────────────────────
-// The best-move search gets exactly the engine's own thinking time, so the
-// suggestion is as deep as the move it has to answer. It used to get a fixed
-// 1.5s split three ways — a quarter of what the engine had at the 2s setting —
-// which is why following the hints lost: that was the engine playing itself
-// with a quarter of the time. The two alternatives get a quarter each.
+// Suggestions come from a continuous analysis in the second worker (see
+// js/worker.js). It deepens for as long as it is your turn, keeps everything
+// it has learned from move to move, and during the engine's turn ponders the
+// position after the reply it expects — so when that reply comes, the
+// suggestion is usually already deep. The old approach ran a fresh timed
+// search each turn and threw the worker away whenever you moved early.
 const HINT_COUNT   = 3;
 let hints          = [];      // [{move, score, mateIn}] best first
-let hintsPending   = false;
+let hintDepth      = 0;
+let hintsPending   = false;   // true until the first usable depth arrives
+let hintsLive      = false;   // true while the analysis is still deepening
 let hintReqId      = 0;
-let hintsDrawn     = 0;       // how many of `hints` are already on screen
+let hintsDrawn     = 0;       // how many of `hints` have arrows on the board
 
 // ── DOM References ─────────────────────────────────────────────────────────
 const boardEl      = document.getElementById('board');
@@ -89,9 +92,9 @@ const confirmNo    = document.getElementById('confirm-no');
 // board or the spinner. If module workers are unavailable the engine still
 // runs on the main thread — correct, just less smooth.
 //
-// Help mode gets a second worker of its own. Sharing one would queue the
-// engine's reply behind a hint search still in progress; with two, a hint
-// search that has gone stale is simply terminated.
+// Help mode gets a second worker of its own, running a continuous analysis.
+// Sharing one would queue the engine's reply behind it; with two, the
+// analysis can even keep working (pondering) while the engine thinks.
 let worker      = null;
 let workerReqId = 0;
 const pendingSearches = new Map();
@@ -121,7 +124,7 @@ function getHintWorker() {
     hintWorker = makeWorker();
     hintWorker.onmessage = (e) => {
       const msg = e.data;
-      if (msg.type === 'hints') receiveHints(msg.id, msg.hints || [], msg.done !== false);
+      if (msg.type === 'analysis') receiveAnalysis(msg);
     };
     hintWorker.onerror = () => { hintWorker = null; };
   } catch (_) {
@@ -388,8 +391,12 @@ function applyMove(mv, bySide) {
 
   if (!gameOver) {
     legalMoves = getLegalMoves(gameState, sideToMove);
-    if (sideToMove === aiSide) requestAIMove();
-    else requestHints();
+    if (sideToMove === aiSide) {
+      if (bySide === humanSide) ponderHints(mv);
+      requestAIMove();
+    } else {
+      requestHints();
+    }
   }
 }
 
@@ -481,60 +488,90 @@ function hintsWanted() {
          sideToMove === humanSide;
 }
 
+function hintPayload(type, extra) {
+  return Object.assign({
+    type,
+    state: JSON.parse(JSON.stringify(gameState)),
+    count: HINT_COUNT,
+    useNN: nnIsReady(),
+    history: zobristKeys.slice(),
+  }, extra);
+}
+
 function requestHints() {
   clearHints();
   if (!hintsWanted()) return;
 
   const id = ++hintReqId;
   hintsPending = true;
+  hintsLive = true;
   renderHintPanel();
-
-  const payload = {
-    type: 'hints', id,
-    state: JSON.parse(JSON.stringify(gameState)),
-    bestMs: thinkTimeMs,
-    restMs: Math.max(300, thinkTimeMs * 0.25),
-    count: HINT_COUNT,
-    useNN: nnIsReady(),
-    history: zobristKeys.slice(),
-  };
 
   const hw = getHintWorker();
   if (hw) {
-    hw.postMessage(payload);
-  } else {
-    // No workers: search here. The board is briefly unresponsive, but the
-    // hints still arrive.
-    setTimeout(() => {
-      if (id !== hintReqId) return;
-      const found = searchTopMoves(payload.state, payload.bestMs, payload.count, payload.useNN,
-                                   { history: payload.history, restMs: payload.restMs });
-      receiveHints(id, found, true);
-    }, 30);
+    hw.postMessage(hintPayload('analyse', { id }));
+    return;
   }
+  // No workers: analyse here for the engine's think time, once. The board is
+  // briefly unresponsive, but the suggestions still arrive.
+  setTimeout(() => {
+    if (id !== hintReqId) return;
+    const a = createAnalysis(gameState, HINT_COUNT, nnIsReady(), zobristKeys.slice());
+    const t0 = Date.now();
+    while (!a.done && Date.now() - t0 < thinkTimeMs) analyseStep(a, 150);
+    receiveAnalysis({ id, lines: a.lines, depth: a.depth, done: true });
+  }, 30);
 }
 
-// Suggestions arrive one at a time, best first. Each arrival only adds to what
-// is on screen, so the ones already shown do not flicker or re-animate.
-function receiveHints(id, found, done) {
-  if (id !== hintReqId || !hintsWanted()) return;   // the position has moved on
-  hintsPending = !done;
-  hints = found;
-  renderHintPanel();
-  renderHintLayer();
+// The player has just moved and the engine is thinking: have the analysis
+// work on the position after the engine's most likely reply.
+function ponderHints(played) {
+  const hw = mode === 'help' ? getHintWorker() : null;
+  if (hw) hw.postMessage(hintPayload('ponder', { played }));
 }
 
-// Drop the current suggestions. A hint search still running is for a position
-// that no longer matters, so its worker is terminated rather than left to
-// compete with the engine for the CPU; the next request starts a fresh one.
-function clearHints() {
-  hintReqId++;
-  if (hintsPending && hintWorker) { hintWorker.terminate(); hintWorker = null; }
+function stopHints() {
+  if (hintWorker) hintWorker.postMessage({ type: 'stop' });
+}
+
+// Each new depth replaces the lines. If the suggested moves are the same as
+// before, only the scores and depth are updated in place, so the arrows do not
+// flicker every time the analysis goes one ply deeper.
+function receiveAnalysis(msg) {
+  if (msg.id !== hintReqId || !hintsWanted()) return;   // the position has moved on
+  const same = msg.lines.length === hints.length &&
+    msg.lines.every((l, i) => sameMove(l.move, hints[i].move));
+  hints = msg.lines;
+  hintDepth = msg.depth;
   hintsPending = false;
-  hints = [];
+  hintsLive = !msg.done;
+  if (!same) {
+    clearHintDisplay();
+    renderHintLayer();
+  }
+  renderHintPanel();
+}
+
+function sameMove(a, b) {
+  return a && b && a.from[0] === b.from[0] && a.from[1] === b.from[1] &&
+         a.to[0] === b.to[0] && a.to[1] === b.to[1] && a.piece === b.piece;
+}
+
+function clearHintDisplay() {
   hintsDrawn = 0;
   hintPanel.innerHTML = '';
   while (hintLayer.firstChild) hintLayer.removeChild(hintLayer.firstChild);
+}
+
+// Drop the current suggestions from the screen. The worker is left running:
+// what it has learned carries over, and the next request redirects it.
+function clearHints() {
+  hintReqId++;
+  hintsPending = false;
+  hintsLive = false;
+  hints = [];
+  hintDepth = 0;
+  clearHintDisplay();
 }
 
 function formatScore(h) {
@@ -546,12 +583,14 @@ function formatScore(h) {
 }
 
 function renderHintPanel() {
-  // Chips for suggestions not yet shown are appended; existing ones stay put.
-  const have = hintPanel.querySelectorAll('.hint-chip').length;
+  const chipsEl = [...hintPanel.querySelectorAll('.hint-chip')];
   hintPanel.querySelector('.hint-note')?.remove();
 
-  for (let i = have; i < hints.length; i++) {
-    const h = hints[i];
+  hints.forEach((h, i) => {
+    if (chipsEl[i]) {                       // already shown: refresh the score only
+      chipsEl[i].querySelector('.score').textContent = formatScore(h);
+      return;
+    }
     const chip = document.createElement('button');
     chip.className = `hint-chip r${i + 1}`;
     chip.title = 'Tap to pick up this piece';
@@ -565,14 +604,14 @@ function renderHintPanel() {
       selectSquare(h.move.from[0], h.move.from[1]);
     });
     hintPanel.appendChild(chip);
-  }
+  });
 
-  if (hintsPending) {
+  if (hintsPending || hints.length) {
     const note = document.createElement('span');
     note.className = 'hint-note';
-    note.innerHTML = hints.length
-      ? '<span class="dots"></span>'
-      : 'Finding your best move<span class="dots"></span>';
+    if (hintsPending) note.innerHTML = 'Finding your best move<span class="dots"></span>';
+    else note.innerHTML = `depth ${hintDepth}` + (hintsLive ? '<span class="dots"></span>' : '');
+    note.title = 'How many moves ahead the analysis has looked. It keeps going while you think.';
     hintPanel.appendChild(note);
   }
 }
@@ -897,7 +936,7 @@ function setMode(next) {
 
   updateBackBtn();
   if (mode === 'help') { if (!hints.length && !hintsPending) requestHints(); }
-  else clearHints();
+  else { clearHints(); stopHints(); }
 }
 
 modeSwitch.querySelectorAll('.mode-btn').forEach(btn => {
@@ -910,6 +949,7 @@ function startNewGame(chosenHumanSide = humanSide) {
   aiThinking   = false;
   hideThinking();
   clearHints();
+  stopHints();
   resetSearchState();  // no knowledge carries over between games
   humanSide    = chosenHumanSide;
   aiSide       = opposite(chosenHumanSide);

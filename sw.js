@@ -1,5 +1,5 @@
 // Bump on every release — a stale cache would keep serving the old JS/model.
-const CACHE = 'chess-v6';
+const CACHE = 'chess-v7';
 
 // Everything needed to play a full game with no network at all.
 const ASSETS = [

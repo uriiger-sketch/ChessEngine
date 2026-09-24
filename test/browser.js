@@ -106,15 +106,21 @@ function check(name, ok, detail) {
     }
     return false;
   };
-  // Suggestions stream in best-first; this waits for the whole set.
+  // Suggestions arrive together at each depth; wait for a full set of three
+  // and a depth readout, meaning the analysis has reported at least once.
   const waitForAllHints = async () => {
     for (let i = 0; i < 120; i++) {
       await sleep(150);
-      const pending = await page.$('#hint-panel .hint-note');
-      if (!pending && (await chips()).length > 0) return true;
+      const depth = await page.evaluate(() =>
+        /depth \d+/.test(document.querySelector('#hint-panel .hint-note')?.textContent || ''));
+      if (depth && (await chips()).length === 3) return true;
     }
     return false;
   };
+  const hintDepth = () => page.evaluate(() => {
+    const m = (document.querySelector('#hint-panel .hint-note')?.textContent || '').match(/depth (\d+)/);
+    return m ? +m[1] : 0;
+  });
 
   // ── Play mode by default ────────────────────────────────────────────────
   check('starts in Play mode', (await mode()) === 'play', await mode());
@@ -161,26 +167,29 @@ function check(name, ok, detail) {
   check('three suggestions listed', c1.length === 3, String(c1.length));
   check('three arrows drawn', (await arrows()) === 3, String(await arrows()));
 
-  // Tapping suggestion 1 picks up its piece, and its arrow's square is a legal target.
-  const target = await page.evaluate(() => {
+  // The analysis keeps deepening while it is the player's turn.
+  const d1 = await hintDepth();
+  await sleep(2500);
+  const d2 = await hintDepth();
+  check('analysis keeps deepening while the player thinks', d2 > d1, `depth ${d1} → ${d2}`);
+
+  // Tapping suggestion 1 picks up its piece, its arrow's square is a legal
+  // target, and playing there works. Done in one step inside the page: the
+  // suggestions update live, and a deeper result could otherwise land between
+  // reading the arrow and tapping the chip.
+  const played = await page.evaluate(() => {
     const groups = document.querySelectorAll('#hint-layer .hint-arrow');
     const best = groups[groups.length - 1];           // drawn last = on top = #1
     const rect = best.querySelector('rect');
-    return { vr: Math.floor(+rect.getAttribute('y') / 100), vc: Math.floor(+rect.getAttribute('x') / 100) };
-  });
-  await page.click('#hint-panel .hint-chip.r1');
-  await sleep(200);
-  const legalAtTarget = await page.evaluate(({ vr, vc }) => {
+    const vr = Math.floor(+rect.getAttribute('y') / 100), vc = Math.floor(+rect.getAttribute('x') / 100);
+    document.querySelector('#hint-panel .hint-chip.r1').dispatchEvent(new MouseEvent('click', { bubbles: true }));
     const sq = document.querySelectorAll('#board .sq')[vr * 8 + vc];
-    return !!document.querySelector('#board .sq.selected') &&
-           (sq.classList.contains('legal') || sq.classList.contains('legal-cap'));
-  }, target);
-  check('suggestion 1 is a legal move for the picked-up piece', legalAtTarget);
-
-  // Play the best suggestion; hints must clear while the engine thinks.
-  await page.evaluate(({ vr, vc }) =>
-    document.querySelectorAll('#board .sq')[vr * 8 + vc]
-      .dispatchEvent(new MouseEvent('click', { bubbles: true })), target);
+    const legal = !!document.querySelector('#board .sq.selected') &&
+                  (sq.classList.contains('legal') || sq.classList.contains('legal-cap'));
+    if (legal) sq.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    return legal;
+  });
+  check('suggestion 1 is a legal move for the picked-up piece', played);
   await sleep(150);
   check('hints cleared after moving', (await arrows()) === 0);
   await waitForAI();
