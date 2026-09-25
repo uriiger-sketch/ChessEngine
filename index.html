@@ -75,7 +75,7 @@
     <div id="mode-caption"></div>
 
     <div id="footer">
-      <div id="version">v2.3</div>
+      <div id="version">v2.4</div>
       <div id="credit">credit: igeru</div>
     </div>
   </div>
@@ -100,13 +100,7 @@
   <!-- UI module (loads chess.js, engine.js, neural.js via imports) -->
   <script type="module" src="js/ui.js"></script>
 
-  <!-- Service worker registration -->
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js').catch(() => {});
-      });
-    }
-  </script>
+  <!-- Service worker registration lives in js/ui.js, which also applies an
+       update without interrupting a game in progress. -->
 </body>
 </html>

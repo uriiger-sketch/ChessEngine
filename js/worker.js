@@ -16,6 +16,11 @@ import {
 } from './engine.js';
 import { makeMove } from './chess.js';
 import { loadModel, isReady as nnIsReady } from './neural.js';
+import { APP_VERSION } from './version.js';
+
+// Announce which build this is before anything else, so the page can refuse a
+// worker from a different release instead of waiting on it forever.
+self.postMessage({ type: 'hello', version: APP_VERSION });
 
 // Load the model once, up front. The main thread waits for the 'ready' message
 // before enabling neural evaluation.
@@ -63,12 +68,24 @@ function post(j, done) {
 async function run(j) {
   if (j.running) return;
   j.running = true;
-  while (job === j && !j.a.done && j.a.elapsed < CAP_MS) {
-    if (analyseStep(j.a, STEP_MS)) post(j, false);
-    await yieldToEvents();
+  try {
+    while (job === j && !j.a.done && j.a.elapsed < CAP_MS) {
+      if (analyseStep(j.a, STEP_MS)) post(j, false);
+      await yieldToEvents();
+    }
+    if (job === j) post(j, true);
+  } catch (err) {
+    failed(j.id, err);
+  } finally {
+    j.running = false;
   }
-  j.running = false;
-  if (job === j) post(j, true);
+}
+
+// Tell the page, so it can fall back to analysing on its own thread rather
+// than showing "Finding your best move" forever.
+function failed(id, err) {
+  if (job && job.id === id) job = null;
+  self.postMessage({ type: 'analysis-error', id, message: String((err && err.message) || err) });
 }
 
 function startAnalysis(msg) {
@@ -120,8 +137,16 @@ self.onmessage = (e) => {
 
   if (msg.type === 'reset')   { job = null; resetEngine(); return; }
   if (msg.type === 'stop')    { job = null; return; }
-  if (msg.type === 'analyse') { startAnalysis(msg); return; }
-  if (msg.type === 'ponder')  { startPonder(msg); return; }
+  if (msg.type === 'analyse') {
+    try { startAnalysis(msg); } catch (err) { failed(msg.id, err); }
+    return;
+  }
+  if (msg.type === 'ponder') {
+    // A failed ponder costs nothing but the head start; the next 'analyse'
+    // simply starts from scratch.
+    try { startPonder(msg); } catch (_) { job = null; }
+    return;
+  }
   if (msg.type !== 'search') return;
 
   try {

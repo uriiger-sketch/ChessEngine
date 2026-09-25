@@ -7,6 +7,7 @@ import {
 } from './chess.js';
 import { loadModel, isReady as nnIsReady, lastError as nnError } from './neural.js';
 import { searchBestMove, createAnalysis, analyseStep, resetEngine, zobristOf, staticEvalOf } from './engine.js';
+import { APP_VERSION } from './version.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let gameState     = null;
@@ -64,6 +65,14 @@ let hintDepth      = 0;
 let hintsPending   = false;   // true until the first usable depth arrives
 let hintsLive      = false;   // true while the analysis is still deepening
 let hintReqId      = 0;
+let hintSource     = null;    // 'worker' or 'main': who is answering the current request
+let hintWatchdog   = null;
+let mainJob        = null;    // on-page analysis, when the worker cannot be used
+// null = not heard from yet, true = matching build, false = unusable.
+let hintWorkerOk   = null;
+// If no suggestion has arrived by then, the page analyses on its own thread.
+// Generous, because a worker's first load can be slow on a poor connection.
+const HINT_WATCHDOG_MS = 4000;
 let hintsDrawn     = 0;       // how many of `hints` have arrows on the board
 
 // ── DOM References ─────────────────────────────────────────────────────────
@@ -99,14 +108,20 @@ let worker      = null;
 let workerReqId = 0;
 const pendingSearches = new Map();
 
-function makeWorker() {
-  return new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+// The version in the URL keeps any cache from handing this page a worker from
+// another release; the 'hello' check catches whatever gets through anyway.
+function makeWorker(role) {
+  return new Worker(new URL(`./worker.js?v=${APP_VERSION}&role=${role}`, import.meta.url),
+                    { type: 'module' });
 }
 
 try {
-  worker = makeWorker();
+  worker = makeWorker('engine');
   worker.onmessage = (e) => {
     const msg = e.data;
+    if (msg.type === 'hello' && msg.version !== APP_VERSION) {
+      console.warn(`[chessnn] engine worker is v${msg.version}, page is v${APP_VERSION}`);
+    }
     if (msg.type === 'result') {
       const resolve = pendingSearches.get(msg.id);
       if (resolve) { pendingSearches.delete(msg.id); resolve(msg); }
@@ -119,18 +134,40 @@ try {
 
 let hintWorker = null;
 function getHintWorker() {
-  if (hintWorker || !worker) return hintWorker;
+  if (hintWorkerOk === false || !worker) return null;
+  if (hintWorker) return hintWorker;
   try {
-    hintWorker = makeWorker();
+    hintWorker = makeWorker('hints');
     hintWorker.onmessage = (e) => {
       const msg = e.data;
-      if (msg.type === 'analysis') receiveAnalysis(msg);
+      if (msg.type === 'hello') {
+        if (msg.version === APP_VERSION) { hintWorkerOk = true; return; }
+        console.warn(`[chessnn] hint worker is v${msg.version}, page is v${APP_VERSION} — analysing on the page instead`);
+        abandonHintWorker();
+      } else if (msg.type === 'analysis') {
+        receiveAnalysis(msg, 'worker');
+      } else if (msg.type === 'analysis-error') {
+        console.warn('[chessnn] hint worker failed:', msg.message);
+        if (msg.id === hintReqId && hintSource === 'worker') startMainAnalysis(msg.id);
+      }
     };
-    hintWorker.onerror = () => { hintWorker = null; };
+    hintWorker.onerror = (e) => {
+      console.warn('[chessnn] hint worker error:', e.message || e);
+      abandonHintWorker();
+    };
   } catch (_) {
     hintWorker = null;
+    hintWorkerOk = false;
   }
   return hintWorker;
+}
+
+// Stop relying on the hint worker for this session, and if a request is
+// waiting on it, answer it from the page instead.
+function abandonHintWorker() {
+  hintWorkerOk = false;
+  if (hintWorker) { try { hintWorker.terminate(); } catch (_) {} hintWorker = null; }
+  if (hintsWanted() && hintSource === 'worker' && (hintsPending || hintsLive)) startMainAnalysis(hintReqId);
 }
 
 // Resolves to {move, info}, searching off-thread when possible.
@@ -508,25 +545,51 @@ function requestHints() {
   renderHintPanel();
 
   const hw = getHintWorker();
-  if (hw) {
-    hw.postMessage(hintPayload('analyse', { id }));
-    return;
-  }
-  // No workers: analyse here for the engine's think time, once. The board is
-  // briefly unresponsive, but the suggestions still arrive.
-  setTimeout(() => {
-    if (id !== hintReqId) return;
-    const a = createAnalysis(gameState, HINT_COUNT, nnIsReady(), zobristKeys.slice());
-    const t0 = Date.now();
-    while (!a.done && Date.now() - t0 < thinkTimeMs) analyseStep(a, 150);
-    receiveAnalysis({ id, lines: a.lines, depth: a.depth, done: true });
-  }, 30);
+  if (!hw) { startMainAnalysis(id); return; }
+
+  hintSource = 'worker';
+  hw.postMessage(hintPayload('analyse', { id }));
+  // Never wait silently: if the worker has said nothing useful in time, the
+  // page does the analysis itself.
+  hintWatchdog = setTimeout(() => {
+    if (id !== hintReqId || !hintsPending || hintSource !== 'worker') return;
+    console.warn('[chessnn] hint worker did not answer — analysing on the page instead');
+    if (hintWorkerOk !== true) abandonHintWorker();
+    else startMainAnalysis(id);
+  }, HINT_WATCHDOG_MS);
+}
+
+// Analysis on the page's own thread: the fallback when the worker is missing,
+// from another build, or not answering. It runs in short slices with a pause
+// between them so taps still get through, and it cannot ponder, but it always
+// produces suggestions.
+function startMainAnalysis(id) {
+  if (id !== hintReqId || !hintsWanted()) return;
+  hintSource = 'main';
+  const job = { a: createAnalysis(gameState, HINT_COUNT, nnIsReady(), zobristKeys.slice()) };
+  mainJob = job;
+  const step = () => {
+    if (mainJob !== job || id !== hintReqId || !hintsWanted()) return;
+    try {
+      if (analyseStep(job.a, 40) && job.a.depth >= 4) {
+        receiveAnalysis({ id, lines: job.a.lines, depth: job.a.depth, done: job.a.done }, 'main');
+      }
+    } catch (err) {
+      console.error('[chessnn] analysis failed:', err);
+      hintsPending = false; hintsLive = false;
+      hintPanel.innerHTML = '<span class="hint-note">Suggestions unavailable — try New Game.</span>';
+      return;
+    }
+    if (!job.a.done && job.a.elapsed < 30000) setTimeout(step, 15);
+    else receiveAnalysis({ id, lines: job.a.lines, depth: job.a.depth, done: true }, 'main');
+  };
+  setTimeout(step, 0);
 }
 
 // The player has just moved and the engine is thinking: have the analysis
 // work on the position after the engine's most likely reply.
 function ponderHints(played) {
-  const hw = mode === 'help' ? getHintWorker() : null;
+  const hw = mode === 'help' && hintWorkerOk !== false ? getHintWorker() : null;
   if (hw) hw.postMessage(hintPayload('ponder', { played }));
 }
 
@@ -537,8 +600,11 @@ function stopHints() {
 // Each new depth replaces the lines. If the suggested moves are the same as
 // before, only the scores and depth are updated in place, so the arrows do not
 // flicker every time the analysis goes one ply deeper.
-function receiveAnalysis(msg) {
+function receiveAnalysis(msg, source) {
   if (msg.id !== hintReqId || !hintsWanted()) return;   // the position has moved on
+  if (source !== hintSource) return;                    // superseded by the fallback
+  if (!msg.lines || !msg.lines.length) return;
+  if (hintWatchdog) { clearTimeout(hintWatchdog); hintWatchdog = null; }
   const same = msg.lines.length === hints.length &&
     msg.lines.every((l, i) => sameMove(l.move, hints[i].move));
   hints = msg.lines;
@@ -567,6 +633,9 @@ function clearHintDisplay() {
 // what it has learned carries over, and the next request redirects it.
 function clearHints() {
   hintReqId++;
+  hintSource = null;
+  mainJob = null;
+  if (hintWatchdog) { clearTimeout(hintWatchdog); hintWatchdog = null; }
   hintsPending = false;
   hintsLive = false;
   hints = [];
@@ -876,6 +945,8 @@ async function requestNewGame(side) {
     const title = side === humanSide ? 'Start a new game?' : `Start a new game as ${cap(side)}?`;
     if (!(await confirmDialog(title, 'The current game will be lost.'))) return;
   }
+  // An update that arrived mid-game is applied now, between games.
+  if (updateReady) { reloadInto(side); return; }
   playWhiteBtn.classList.toggle('active', side === 'white');
   playBlackBtn.classList.toggle('active', side === 'black');
   startNewGame(side);
@@ -943,6 +1014,36 @@ modeSwitch.querySelectorAll('.mode-btn').forEach(btn => {
   bindTap(btn, () => setMode(btn.dataset.mode));
 });
 
+// ── Updates ────────────────────────────────────────────────────────────────
+// The page keeps running the code it loaded with even after a newer service
+// worker takes over, so an update only really arrives on a reload. It is
+// applied at once when no game is under way, and otherwise at the next New
+// Game — never in the middle of one.
+let updateReady = false;
+
+function reloadInto(side) {
+  try { sessionStorage.setItem('chessnn.side', side); } catch (_) {}
+  location.reload();
+}
+
+if ('serviceWorker' in navigator) {
+  const wasControlled = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    // The very first install also claims the page; that is not an update.
+    if (!wasControlled || updateReady) return;
+    updateReady = true;
+    if (!gameInProgress()) reloadInto(humanSide);
+  });
+  window.addEventListener('load', () => {
+    // 'none': always check sw.js itself with the server, so a release is
+    // noticed on the next visit instead of whenever the HTTP cache expires.
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
+  });
+}
+
+// The footer shows the version actually running, not whatever the HTML says.
+document.getElementById('version').textContent = 'v' + APP_VERSION.replace(/\.0$/, '');
+
 // ── Initialization ─────────────────────────────────────────────────────────
 function startNewGame(chosenHumanSide = humanSide) {
   gameId++;            // invalidates any search still running for the old game
@@ -979,4 +1080,12 @@ function startNewGame(chosenHumanSide = humanSide) {
 
 buildBoard();
 setMode(mode);
-startNewGame();
+{
+  // Colour chosen just before an update reload.
+  let side = 'white';
+  try { side = sessionStorage.getItem('chessnn.side') || 'white'; sessionStorage.removeItem('chessnn.side'); } catch (_) {}
+  if (side !== 'white' && side !== 'black') side = 'white';
+  playWhiteBtn.classList.toggle('active', side === 'white');
+  playBlackBtn.classList.toggle('active', side === 'black');
+  startNewGame(side);
+}

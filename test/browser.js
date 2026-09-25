@@ -23,10 +23,20 @@ const TYPES = {
   '.json': 'application/json', '.png': 'image/png', '.bin': 'application/octet-stream',
 };
 
+// When set, the Help-mode worker is replaced by this script, to prove the page
+// copes with a worker from another release or one that never answers.
+let hintWorkerOverride = null;
+const APP = fs.readFileSync(path.join(ROOT, 'js/version.js'), 'utf8').match(/APP_VERSION = '([^']+)'/)[1];
+
 function serve() {
   return http.createServer((req, res) => {
     let p = decodeURIComponent(req.url.split('?')[0]);
     if (p === '/') p = '/index.html';
+    if (hintWorkerOverride && req.url.includes('role=hints')) {
+      res.writeHead(200, { 'Content-Type': 'text/javascript' });
+      res.end(hintWorkerOverride);
+      return;
+    }
     const file = path.join(ROOT, p);
     if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
       res.writeHead(404); res.end('not found'); return;
@@ -260,6 +270,33 @@ function check(name, ok, detail) {
   const blackStatus = await waitForAI();
   check('engine opens when player is Black', blackStatus.includes('Black to move'), blackStatus);
   check('hints for Black after the engine opens', await waitForHints());
+
+  // ── Help mode must never hang ───────────────────────────────────────────
+  // v2.3 on a phone whose cache mixed two releases: the worker ignored every
+  // request and Help sat on "Finding your best move" forever. The page must
+  // now notice and analyse on its own thread instead.
+  check('footer shows the running version', (await page.textContent('#version')).trim() === 'v' + APP.replace(/\.0$/, ''));
+  const brokenWorkers = [
+    ['from another release', "self.postMessage({ type: 'hello', version: '0.0.1' });"],
+    ['that never answers',   `self.postMessage({ type: 'hello', version: '${APP}' }); self.onmessage = () => {};`],
+    ['that fails to load',   'throw new Error("boom");'],
+  ];
+  for (const [label, body] of brokenWorkers) {
+    hintWorkerOverride = body;
+    const ctx2 = await browser.newContext({ serviceWorkers: 'block' });
+    const p2 = await ctx2.newPage();
+    await p2.goto(`http://localhost:${PORT}/index.html`, { waitUntil: 'networkidle' });
+    await sleep(800);
+    await p2.click('.mode-btn[data-mode="help"]');
+    let shown = false;
+    for (let i = 0; i < 70; i++) {
+      await sleep(150);
+      if ((await p2.$$('#hint-panel .hint-chip')).length === 3) { shown = true; break; }
+    }
+    check(`Help still shows moves with a hint worker ${label}`, shown);
+    await ctx2.close();
+  }
+  hintWorkerOverride = null;
 
   // ── Console must be clean ───────────────────────────────────────────────
   check('no console or page errors', errors.length === 0,
