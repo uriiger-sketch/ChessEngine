@@ -7,4 +7,4 @@
 // ignored every request and Help mode hung on "Finding your best move".
 // Now each worker announces its version the moment it starts, and the page
 // refuses to rely on one that does not match.
-export const APP_VERSION = '2.5.0';
+export const APP_VERSION = '2.6.0';

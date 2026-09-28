@@ -6,7 +6,7 @@ import {
   isInCheck, PIECE_GLYPHS, opposite, positionKey
 } from './chess.js';
 import { loadModel, isReady as nnIsReady, lastError as nnError } from './neural.js';
-import { searchBestMove, createAnalysis, analyseStep, resetEngine, zobristOf, staticEvalOf } from './engine.js';
+import { searchBestMove, searchNetworkMove, createAnalysis, analyseStep, resetEngine, zobristOf, staticEvalOf } from './engine.js';
 import { APP_VERSION } from './version.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -17,6 +17,9 @@ let legalMoves    = [];
 let selectedSq    = null;
 let selectedLegal = [];
 let thinkTimeMs   = 5000;   // set from the slider: 1–15 whole seconds
+// 'engine': the full engine. 'network': the trained network on its own,
+// choosing by its own prediction with no look-ahead (see searchNetworkMove).
+let opponent      = 'engine';
 let gameOver      = false;
 let sideToMove    = 'white';
 let aiThinking    = false;
@@ -76,6 +79,12 @@ const HINT_WATCHDOG_MS = 4000;
 // How long the suggestions keep refining on the player's turn, from the moment
 // the turn starts, unless they move sooner. The panel counts it down.
 const HINT_TURN_MS = 60000;
+// How much worse than equal a draw counts for the player in Help mode's
+// analysis (see "Contempt" in js/engine.js). Off: it was measured (test/
+// timeodds.js --contempt) after the mop-up endgame fix and showed no benefit —
+// the repetition draws it was meant to prevent came from won endgames the
+// engine could not finish, and the mop-up term fixed those directly.
+const HELP_CONTEMPT_CP = 0;
 let hintTurnStart  = 0;
 let hintTicker     = null;
 let hintsDrawn     = 0;       // how many of `hints` have arrows on the board
@@ -183,13 +192,15 @@ function findBestMove(state, timeLimit, historyKeys) {
       const id = ++workerReqId;
       pendingSearches.set(id, resolve);
       worker.postMessage({
-        type: 'search', id, state, timeLimit, useNN: withNN, history: historyKeys,
+        type: 'search', id, state, timeLimit, useNN: withNN, history: historyKeys, opponent,
       });
     });
   }
   return new Promise(resolve => {
     setTimeout(() => {
-      const move = searchBestMove(state, timeLimit, withNN, { history: historyKeys });
+      const move = opponent === 'network'
+        ? searchNetworkMove(state, { history: historyKeys })
+        : searchBestMove(state, timeLimit, withNN, { history: historyKeys });
       resolve({ move, info: null });
     }, 20);
   });
@@ -537,6 +548,8 @@ function hintPayload(type, extra) {
     count: HINT_COUNT,
     useNN: nnIsReady(),
     history: zobristKeys.slice(),
+    player: humanSide === 'white' ? 1 : -1,
+    contemptCp: HELP_CONTEMPT_CP,
   }, extra);
 }
 
@@ -577,7 +590,9 @@ function requestHints() {
 function startMainAnalysis(id) {
   if (id !== hintReqId || !hintsWanted()) return;
   hintSource = 'main';
-  const job = { a: createAnalysis(gameState, HINT_COUNT, nnIsReady(), zobristKeys.slice()) };
+  const job = { a: createAnalysis(gameState, HINT_COUNT, nnIsReady(), zobristKeys.slice(),
+                                 { contemptSide: humanSide === 'white' ? 1 : -1,
+                                   contemptCp: HELP_CONTEMPT_CP }) };
   mainJob = job;
   const step = () => {
     if (mainJob !== job || id !== hintReqId || !hintsWanted()) return;
@@ -864,7 +879,10 @@ function requestAIMove() {
     const best = res && res.move;
     if (!best) { setStatus('AI has no legal move!'); return; }
 
-    searchedEval = res.info && typeof res.info.score === 'number' ? res.info.score : null;
+    // The network-only opponent's score is a one-move prediction, not a
+    // searched evaluation, so the bar keeps using the engine's own reading.
+    searchedEval = opponent === 'engine' && res.info && typeof res.info.score === 'number'
+      ? res.info.score : null;
     applyMove(best, forSide);
   });
 }
@@ -897,7 +915,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
 function showThinking() {
   thinkingEl.removeAttribute('hidden');
-  setStatus('AI thinking…', 'thinking');
+  setStatus(opponent === 'network' ? 'Network choosing…' : 'AI thinking…', 'thinking');
 }
 function hideThinking() {
   thinkingEl.setAttribute('hidden', '');
@@ -1014,6 +1032,30 @@ thinkSlider.addEventListener('input', () => setThinkSeconds(thinkSlider.value, t
   let saved = null;
   try { saved = localStorage.getItem('chessnn.thinkSec'); } catch (_) {}
   setThinkSeconds(saved || thinkSlider.value, false);
+}
+
+// ── Opponent ───────────────────────────────────────────────────────────────
+// Can be changed at any point; it applies from the opponent's next move.
+const oppButtons = document.querySelectorAll('.opp-btn');
+const thinkRow   = document.getElementById('think-row');
+
+function setOpponent(o, save) {
+  if (o !== 'engine' && o !== 'network') o = 'engine';
+  opponent = o;
+  oppButtons.forEach(b => b.setAttribute('aria-checked', String(b.dataset.opp === o)));
+  const net = o === 'network';
+  thinkRow.classList.toggle('off', net);
+  thinkSlider.disabled = net;
+  if (net) thinkValue.textContent = 'instant';
+  else setThinkSeconds(thinkTimeMs / 1000, false);
+  if (save) { try { localStorage.setItem('chessnn.opponent', o); } catch (_) {} }
+}
+
+oppButtons.forEach(b => bindTap(b, () => setOpponent(b.dataset.opp, true)));
+{
+  let saved = null;
+  try { saved = localStorage.getItem('chessnn.opponent'); } catch (_) {}
+  setOpponent(saved || 'engine', false);
 }
 
 // ── Mode switching ─────────────────────────────────────────────────────────

@@ -121,7 +121,16 @@ for (let g = 0; g < GAMES; g++) {
   }
   const humanScore = r === 0 ? 0 : ((r === 1) === humanWhite ? 1 : -1);
   if (humanScore > 0) hw++; else if (humanScore < 0) aw++; else d++;
-  console.log(`game ${g + 1}: hint-follower as ${humanWhite ? 'White' : 'Black'} — ${humanScore > 0 ? 'WINS' : humanScore < 0 ? 'loses' : 'draw'} (${result})   running +${hw} =${d} -${aw}`);
+  // Material at the end, from the player's side — a draw a queen up is a very
+  // different failure from a draw in a level position.
+  const V = [0, 1, 3, 3, 5, 9, 0];
+  let mat = 0, pieces = [];
+  for (const row of st.board) for (const p of row) {
+    if (p) { mat += Math.sign(p) * V[Math.abs(p)]; if (Math.abs(p) !== 6) pieces.push((p > 0 ? 'W' : 'b') + ' PNBRQ'[Math.abs(p)]); }
+  }
+  if (!humanWhite) mat = -mat;
+  console.log(`game ${g + 1}: hint-follower as ${humanWhite ? 'White' : 'Black'} — ${humanScore > 0 ? 'WINS' : humanScore < 0 ? 'loses' : 'draw'} (${result})   ` +
+              `plies ${keys.length / 2 - 1}  player material ${mat >= 0 ? '+' : ''}${mat}  [${pieces.sort().join(' ')}]   running +${hw} =${d} -${aw}`);
 }
 
 console.log(`\n[${MODE}] hint-follower: ${hw} wins, ${d} draws, ${aw} losses   (engine ${AI_MS}ms, player thinks ${PLAYER_MS}ms, player NN ${HINT_NN ? 'on' : 'off'})`);

@@ -53,6 +53,14 @@
       <output id="think-value" for="think-slider">5 s</output>
     </div>
 
+    <!-- Who you play: the full engine, or the trained network on its own -->
+    <div id="opponent-row" role="radiogroup" aria-label="Opponent">
+      <span class="row-label">Opponent</span>
+      <button class="opp-btn" role="radio" data-opp="engine" aria-checked="true">Full engine</button>
+      <button class="opp-btn" role="radio" data-opp="network" aria-checked="false"
+              title="Only the network trained on the master games: it judges each move by its own prediction, with no look-ahead">Network only</button>
+    </div>
+
     <!-- Color selection -->
     <div class="btn-row">
       <button class="ctrl-btn active" id="play-white-btn">Play White</button>
@@ -76,7 +84,7 @@
     <div id="mode-caption"></div>
 
     <div id="footer">
-      <div id="version">v2.5</div>
+      <div id="version">v2.6</div>
       <div id="credit">credit: igeru</div>
     </div>
   </div>

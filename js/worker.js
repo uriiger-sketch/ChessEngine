@@ -11,7 +11,7 @@
 // versions had to block the UI thread instead.
 
 import {
-  searchBestMove, resetEngine, searchInfo,
+  searchBestMove, searchNetworkMove, resetEngine, searchInfo,
   createAnalysis, analyseStep, analysisMatches, expectedReply, zobristOf,
 } from './engine.js';
 import { makeMove } from './chess.js';
@@ -106,6 +106,12 @@ function failed(id, err) {
   self.postMessage({ type: 'analysis-error', id, message: String((err && err.message) || err) });
 }
 
+// Contempt always belongs to the player's colour, whichever side is to move in
+// the position being analysed, so everything in the table is scored alike.
+function helpOpts(msg) {
+  return { contemptSide: msg.player || 0, contemptCp: msg.contemptCp || 0 };
+}
+
 function startAnalysis(msg) {
   // Already on it — typically a ponder hit: the engine played the reply we
   // expected, so the analysis has been deepening this exact position all
@@ -116,7 +122,7 @@ function startAnalysis(msg) {
     run(job);
     return;
   }
-  job = { a: createAnalysis(msg.state, msg.count, msg.useNN && nnIsReady(), msg.history),
+  job = { a: createAnalysis(msg.state, msg.count, msg.useNN && nnIsReady(), msg.history, helpOpts(msg)),
           running: false };
   beginTurn(job, msg);
   run(job);
@@ -132,7 +138,7 @@ function startPonder(msg) {
   if (!guess) {
     // The player left the analysed lines. Find the engine's likely reply with
     // a short search of its own position, then ponder after that.
-    const probe = createAnalysis(msg.state, 1, msg.useNN && nnIsReady(), msg.history);
+    const probe = createAnalysis(msg.state, 1, msg.useNN && nnIsReady(), msg.history, helpOpts(msg));
     const t0 = Date.now();
     while (!probe.done && probe.depth < 8 && Date.now() - t0 < 400) analyseStep(probe, 100);
     const reply = probe.lines[0] && probe.lines[0].move;
@@ -144,7 +150,7 @@ function startPonder(msg) {
 
   const side = guess.state._sideToMove;
   const history = (msg.history || []).concat(zobristOf(guess.state, side));
-  job = { a: createAnalysis(guess.state, msg.count, msg.useNN && nnIsReady(), history),
+  job = { a: createAnalysis(guess.state, msg.count, msg.useNN && nnIsReady(), history, helpOpts(msg)),
           id: 0, ponder: true, running: false };
   run(job);
 }
@@ -168,9 +174,9 @@ self.onmessage = (e) => {
   if (msg.type !== 'search') return;
 
   try {
-    const move = searchBestMove(msg.state, msg.timeLimit, msg.useNN && nnIsReady(), {
-      history: msg.history,
-    });
+    const move = msg.opponent === 'network'
+      ? searchNetworkMove(msg.state, { history: msg.history })
+      : searchBestMove(msg.state, msg.timeLimit, msg.useNN && nnIsReady(), { history: msg.history });
     self.postMessage({
       type: 'result', id: msg.id, move,
       info: { depth: searchInfo.depth, score: searchInfo.score, nodes: searchInfo.nodes },

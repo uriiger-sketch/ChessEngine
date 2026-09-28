@@ -10,6 +10,7 @@
 //   node test/match.js --games 20 --ms 300                  new vs old engine
 //   node test/match.js --games 20 --ms 300 --app            as shipped (NN on) vs old
 //   node test/match.js --games 20 --ms 300 --mode nn        new+NN vs new without
+//   node test/match.js --games 20 --ms 100 --mode network   full engine vs network only
 //
 // The Elo figure is the standard logistic conversion of the score rate, with a
 // 95% confidence interval — with a few dozen games the interval is wide, and
@@ -18,7 +19,7 @@
 import {
   initState, makeMove, getLegalMoves, getGameStatus, positionKey, opposite
 } from '../js/chess.js';
-import { searchBestMove as searchNew, resetEngine, zobristOf, setNNGain, setNNSplitEval } from '../js/engine.js';
+import { searchBestMove as searchNew, searchNetworkMove, resetEngine, zobristOf, setNNGain, setNNSplitEval } from '../js/engine.js';
 import { searchBestMove as searchOld } from './legacy-engine.js';
 import { loadModelFromDisk, nnReady, uiMoveToString } from './harness.js';
 
@@ -43,7 +44,14 @@ console.log(`Neural net: ${nnReady() ? 'loaded' : 'not available'}`);
 // Each player is a function (state, side, historyKeys) → chess.js move object.
 let playerA, playerB, nameA, nameB;
 
-if (MODE === 'nn') {
+if (MODE === 'network') {
+  // The app's "Network only" opponent against the full engine.
+  if (!nnLoaded) { console.error('network mode needs a loadable model.'); process.exit(2); }
+  nameA = `full engine (${MS}ms)`;
+  nameB = 'network only';
+  playerA = (st, side, hist) => searchNew(st, MS, true, { history: hist });
+  playerB = (st, side, hist) => searchNetworkMove(st, { history: hist });
+} else if (MODE === 'nn') {
   if (!nnLoaded) { console.error('NN mode needs a loadable model.'); process.exit(2); }
   nameA = `new engine + NN (gain ${GAIN}${SPLIT ? ', split eval' : ''})`;
   nameB = 'new engine, hand eval only';

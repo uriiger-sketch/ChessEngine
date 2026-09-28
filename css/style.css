@@ -16,7 +16,7 @@
   /* Board size: fill the width in portrait, but always leave the controls the
      height they need (~330px). Reserving too little clipped them on small
      phones and in laptop windows, where taps then landed on the wrong row. */
-  --controls-h: 332px;
+  --controls-h: 368px;
   --board-size: min(100vw, calc(100svh - var(--controls-h)));
   --sq-size: calc(var(--board-size) / 8);
   --piece-size: calc(var(--sq-size) * 0.82);
@@ -262,6 +262,44 @@ body {
 #think-slider::-moz-range-thumb {
   width: 26px; height: 26px; border-radius: 50%;
   background: #f0f0f0; border: 2px solid var(--accent);
+}
+
+/* ── Opponent choice ── */
+#opponent-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#opponent-row .row-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #aaa;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.opp-btn {
+  flex: 1;
+  min-height: 32px;
+  border-radius: 8px;
+  border: 1px solid #3a3a3a;
+  background: #262626;
+  color: #9a9a9a;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease;
+}
+.opp-btn[aria-checked="true"] { background: #3d3d3d; color: #fff; border-color: var(--accent); }
+
+/* The network answers instantly, so the think-time slider has nothing to do. */
+#think-row.off { opacity: 0.4; }
+
+/* Short screens (iPhone SE): the mode caption is the first thing to give up
+   its line, so the board keeps its size. */
+@media (max-height: 700px) and (orientation: portrait) {
+  #mode-caption { display: none; }
+  :root { --controls-h: 346px; }
 }
 
 /* Button rows */

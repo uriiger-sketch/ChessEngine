@@ -433,9 +433,29 @@ export function evaluate(pos) {
   if (score > 0 && wPawns === 0 && wNonPawn - bNonPawn < MG_VAL[4]) score /= 4;
   if (score < 0 && bPawns === 0 && bNonPawn - wNonPawn < MG_VAL[4]) score /= 4;
 
+  // Mop-up. Winning a pawnless endgame — K+R v K, K+Q v K+R, two bishops —
+  // means herding the defending king to the edge, which takes far longer than
+  // the search can see. Without guidance every non-losing move looks alike,
+  // the winning side shuffles, and the fifty-move rule draws it: at phone-like
+  // search speed that happened with K+R v K and K+Q v K+R. So once one side is
+  // at least a rook ahead and the other has no pawns left, reward pushing the
+  // losing king toward the edge and bringing the winning king up to it.
+  const matW = wNonPawn + wPawns * MG_VAL[1];
+  const matB = bNonPawn + bPawns * MG_VAL[1];
+  if (bPawns === 0 && matW - matB >= MG_VAL[4]) score += mopUp(wkSq, bkSq);
+  else if (wPawns === 0 && matB - matW >= MG_VAL[4]) score -= mopUp(bkSq, wkSq);
+
   score += pos.stm > 0 ? TEMPO : -TEMPO;
   score = score | 0;                       // the search works in whole centipawns
   return pos.stm > 0 ? score : -score;
+}
+
+// Edge-ward pressure on the defending king plus king proximity, in centipawns.
+function mopUp(winK, loseK) {
+  const lr = loseK >> 3, lc = loseK & 7, wr = winK >> 3, wc = winK & 7;
+  const centreDist = Math.max(3 - lr, lr - 4) + Math.max(3 - lc, lc - 4);   // 0 … 6
+  const kingDist = Math.abs(lr - wr) + Math.abs(lc - wc);                    // 1 … 14
+  return 14 * centreDist + 6 * (14 - kingDist);
 }
 
 // Penalty for missing pawn cover on the king's file and its neighbours.

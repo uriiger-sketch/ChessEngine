@@ -142,6 +142,22 @@ const LMR = new Int32Array(64 * 64);
       LMR[d * 64 + m] = Math.max(0, (0.75 + Math.log(d) * Math.log(m) / 2.25) | 0);
 })();
 
+// ── Contempt ───────────────────────────────────────────────────────────────
+// What a draw is worth. Normally exactly zero. Help mode's analysis, though,
+// works for a player with far more thinking time than the engine they face,
+// and against a weaker opponent a draw is a missed win: scored as zero, a
+// repetition looks as good as a small edge, and the analysis steered into
+// repetitions whenever the opponent could offer one. With contempt, draws
+// count as slightly bad for `contemptSide`, so it plays on whenever it has
+// anything better — and still takes a draw when the alternative is losing.
+let contemptSide = 0;       // 1 White, -1 Black, 0 none
+let contemptCp   = 0;
+
+function drawScore(p) {
+  if (contemptSide === 0) return 0;
+  return p.stm === contemptSide ? -contemptCp : contemptCp;
+}
+
 // ── Search state ───────────────────────────────────────────────────────────
 let aborted    = false;
 let startTime  = 0;
@@ -157,7 +173,26 @@ const pos = new Position();
 // (reverse futility, razoring, null move) are tuned against the hand
 // evaluation's scale and are very sensitive to noise in it — a wrong decision
 // there discards a whole subtree, where a wrong leaf score only misvalues one.
+// Network-only mode: the position is judged by the trained model alone —
+// exactly the quantity it was trained to predict, material plus its learned
+// correction — with none of the hand-written evaluation.
+let networkOnly = false;
+const NET_MATERIAL = [0, 100, 300, 300, 500, 900, 0];
+
+function networkEval(p) {
+  let mat = 0;
+  const b = p.board;
+  for (let sq = 0; sq < 64; sq++) {
+    const pc = b[sq];
+    if (pc > 0) mat += NET_MATERIAL[pc]; else if (pc < 0) mat -= NET_MATERIAL[-pc];
+  }
+  const s = nnIsReady() ? nnEvaluate(p.board, p.stm, p.castling) : 0;
+  const white = mat + (s || 0) * 100;
+  return (p.stm > 0 ? white : -white) | 0;
+}
+
 function evalLeaf(p, forPruning) {
+  if (networkOnly) return networkEval(p);
   const slot = p.keyLo & EV_MASK;
   if (!forPruning && evOk[slot] && evKey[slot] === p.keyHi) return evVal[slot];
 
@@ -259,7 +294,7 @@ function quiescence(p, alpha, beta, ply, qPly = 0) {
   if (aborted) return 0;
   if (ply > seldepth) seldepth = ply;
 
-  if (p.isRepetition() || p.isFiftyMove() || p.insufficientMaterial()) return 0;
+  if (p.isRepetition() || p.isFiftyMove() || p.insufficientMaterial()) return drawScore(p);
   if (p.ply >= MAX_PLY - 4) return evalLeaf(p);
 
   const inCheck = p.inCheck() && qPly < Q_CHECK_PLIES;
@@ -311,7 +346,7 @@ function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
   pvLength[ply] = ply;
 
   if (ply > 0) {
-    if (p.isRepetition() || p.isFiftyMove() || p.insufficientMaterial()) return 0;
+    if (p.isRepetition() || p.isFiftyMove() || p.insufficientMaterial()) return drawScore(p);
     if (p.ply >= MAX_PLY - 4) return evalLeaf(p);
 
     // Mate-distance pruning: a mate already found closer to the root cannot be
@@ -467,12 +502,12 @@ function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
     }
   }
 
-  if (moveCount === 0) return inCheck ? -MATE + ply : 0;   // mate or stalemate
+  if (moveCount === 0) return inCheck ? -MATE + ply : drawScore(p);   // mate or stalemate
 
   // Store, preferring deeper entries but always replacing stale generations.
   // A root searched with moves excluded has a score for a restricted move list,
   // which is not the position's value, so it is kept out of the table.
-  const restricted = ply === 0 && rootExclude !== null;
+  const restricted = (ply === 0 && rootExclude !== null) || networkOnly;
   if (!aborted && !restricted && (ttFlag[slot] === 0 || ttAge[slot] !== ttGen || ttDepth[slot] <= depth)) {
     let s = bestScore;
     if (s > MATE_BOUND) s += ply;
@@ -513,12 +548,12 @@ function beginSearch(timeLimit, useNN) {
 // One iterative-deepening search from the root, up to the current hard limit.
 // Only completed iterations count; the answer never comes from a search that
 // was cut off partway through.
-function iterate(p, softLimit) {
+function iterate(p, softLimit, maxDepth = MAX_DEPTH) {
   pvLength.fill(0);
   pvTable[0] = NO_MOVE;
 
   let best = NO_MOVE, bestScore = 0, done = 0;
-  for (let depth = 1; depth <= MAX_DEPTH; depth++) {
+  for (let depth = 1; depth <= maxDepth; depth++) {
     let score;
     // Aspiration windows: assume the score moved little since the last
     // iteration and re-search wider only when that assumption fails.
@@ -595,6 +630,9 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
 
   beginSearch(timeLimit, useNN);
   loadRoot(state, side, opts);
+  // The engine the player faces never uses contempt; harnesses may ask for it.
+  contemptCp = opts && opts.contempt ? opts.contempt : 0;
+  contemptSide = contemptCp ? (side === 'white' ? 1 : -1) : 0;
 
   // Nothing to think about with a single legal reply.
   if (uiMoves.length === 1) {
@@ -607,6 +645,32 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
   if (r.move === NO_MOVE) return uiMoves[0];
   searchInfo.depth = r.depth;
   return matchUIMove(r.move, uiMoves) || uiMoves[0];
+}
+
+/**
+ * The trained network playing on its own: every legal move is scored by the
+ * model's prediction for the position it leads to, and the best is played.
+ * There is no look-ahead beyond that single move, apart from playing capture
+ * sequences out to the end — without that it would leave pieces hanging to a
+ * single capture, which says nothing about what the network learned. No
+ * hand-written evaluation is involved.
+ */
+export function searchNetworkMove(state, opts) {
+  const side = state._sideToMove || state.sideToMove || 'white';
+  const uiMoves = getLegalMoves(state, side);
+  if (uiMoves.length === 0) return null;
+  if (uiMoves.length === 1) return uiMoves[0];
+
+  beginSearch(5000, true);
+  loadRoot(state, side, opts);
+  networkOnly = true;
+  try {
+    const r = iterate(pos, startTime + 5000, 1);
+    searchInfo.depth = 1;
+    return (r.move !== NO_MOVE && matchUIMove(r.move, uiMoves)) || uiMoves[0];
+  } finally {
+    networkOnly = false;
+  }
 }
 
 /**
@@ -678,12 +742,13 @@ export function searchTopMoves(state, bestMs, count, useNN, opts = {}) {
 // rank consistently.
 
 /** Start analysing a position. Returns a handle for analyseStep(). */
-export function createAnalysis(state, count, useNN, history) {
+export function createAnalysis(state, count, useNN, history, opts = {}) {
   const side = state._sideToMove || state.sideToMove || 'white';
   const snap = JSON.parse(JSON.stringify(state));
   snap._sideToMove = side;
   const a = {
     state: snap, side, useNN: !!useNN,
+    contemptSide: opts.contemptSide || 0, contemptCp: opts.contemptCp || 0,
     history: history && history.length ? history.slice() : null,
     uiMoves: getLegalMoves(snap, side),
     key: null, depth: 0, lines: [], rootMoves: [], count: 0,
@@ -836,7 +901,17 @@ export function analyseStep(a, ms) {
   if (a.done) return false;
   loadRoot(a.state, a.side, { history: a.history });
   beginSlice(ms, a.useNN);
+  contemptSide = a.contemptSide;
+  contemptCp = a.contemptCp;
+  try {
+    return analyseSteps(a);
+  } finally {
+    contemptSide = 0;
+    contemptCp = 0;
+  }
+}
 
+function analyseSteps(a) {
   let improved = false;
   while (!a.done && Date.now() < hardLimit) {
     const d = a.depth + 1;

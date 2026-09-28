@@ -151,6 +151,24 @@ function check(name, ok, detail) {
   await playHuman(); await sleep(100); await waitForAI();
   const at4 = Date.now() - t0;
   check('engine takes longer at the 4 s setting', at4 > 1500 && at4 < 5500, `${at4}ms`);
+  // ── Opponent: full engine or the network on its own ─────────────────────
+  check('full engine is the default opponent',
+        (await page.getAttribute('.opp-btn[data-opp="engine"]', 'aria-checked')) === 'true');
+  await page.click('.opp-btn[data-opp="network"]');
+  await sleep(150);
+  check('network-only can be chosen',
+        (await page.getAttribute('.opp-btn[data-opp="network"]', 'aria-checked')) === 'true');
+  check('think time is not used against the network',
+        (await page.isDisabled('#think-slider')) && (await page.textContent('#think-value')).trim() === 'instant');
+  t0 = Date.now();
+  await playHuman(); await sleep(100); await waitForAI();
+  const atNet = Date.now() - t0;
+  check('the network answers at once', atNet < 1500, `${atNet}ms`);
+  await page.click('.opp-btn[data-opp="engine"]');
+  await sleep(150);
+  check('back to the full engine restores the slider',
+        !(await page.isDisabled('#think-slider')) && (await page.textContent('#think-value')).trim() === '4 s');
+
   await setThink(2);                       // keep the rest of the run quick
   await page.click('#new-game-btn'); await sleep(250);
   if (!(await page.isHidden('#confirm-modal'))) await page.click('#confirm-yes');
