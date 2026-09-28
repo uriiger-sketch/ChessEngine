@@ -539,7 +539,10 @@ let rootExclude = null;
 
 function beginSearch(timeLimit, useNN) {
   startTime = Date.now();
-  hardLimit = startTime + Math.max(30, timeLimit * 0.95);
+  // A small floor so even a tiny budget completes a one-ply search (well under
+  // a millisecond). The app never asks for less than a second; the rating
+  // harness (test/rate-network.js) goes down to a few milliseconds.
+  hardLimit = startTime + Math.max(8, timeLimit * 0.95);
   aborted = false;
   nodes = 0;
   seldepth = 0;

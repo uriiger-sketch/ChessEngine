@@ -18,6 +18,7 @@
     "test:update": "PLAYWRIGHT_PATH=/opt/node22/lib/node_modules/playwright node test/update.js",
     "book": "cd train && node book.js",
     "test:book": "node test/book.js",
-    "test:convert": "node test/convert.js --ms 80"
+    "test:convert": "node test/convert.js --ms 80",
+    "rate:network": "for ms in 10 20 40 80 160; do node test/rate-network.js --ms $ms --games 20 --seed $ms > /tmp/rate_$ms.txt; done; node test/rate-summary.js /tmp/rate_10.txt /tmp/rate_20.txt /tmp/rate_40.txt /tmp/rate_80.txt /tmp/rate_160.txt"
   }
 }
