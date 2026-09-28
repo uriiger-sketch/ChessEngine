@@ -158,16 +158,41 @@ function check(name, ok, detail) {
   await sleep(150);
   check('network-only can be chosen',
         (await page.getAttribute('.opp-btn[data-opp="network"]', 'aria-checked')) === 'true');
-  check('think time is not used against the network',
-        (await page.isDisabled('#think-slider')) && (await page.textContent('#think-value')).trim() === 'instant');
+  const netSlider = await page.evaluate(() => ({
+    label: document.querySelector('#think-row label').textContent,
+    min: document.getElementById('think-slider').min, max: document.getElementById('think-slider').max,
+    value: document.getElementById('think-value').textContent.trim() }));
+  check('against the network the slider sets look-ahead, 1–5 moves',
+        /looks ahead/i.test(netSlider.label) && netSlider.min === '1' && netSlider.max === '5' &&
+        netSlider.value === '3 moves', JSON.stringify(netSlider));
   t0 = Date.now();
   await playHuman(); await sleep(100); await waitForAI();
   const atNet = Date.now() - t0;
-  check('the network answers at once', atNet < 1500, `${atNet}ms`);
+  check('the network answers quickly at 3 moves ahead', atNet < 4000, `${atNet}ms`);
+  await setThink(1);
+  check('look-ahead can be changed', (await page.textContent('#think-value')).trim() === '1 move');
+  await setThink(3);
   await page.click('.opp-btn[data-opp="engine"]');
   await sleep(150);
-  check('back to the full engine restores the slider',
-        !(await page.isDisabled('#think-slider')) && (await page.textContent('#think-value')).trim() === '4 s');
+  check('back to the full engine restores its seconds',
+        (await page.textContent('#think-row label')).trim() === 'Engine thinks' &&
+        (await page.textContent('#think-value')).trim() === '4 s');
+
+  // Opening names come from the book, in the real browser (fetched, not read).
+  const names = await page.evaluate(async () => {
+    const { openingName, bookReady } = await import('/js/book.js');
+    const { initState, makeMove, getLegalMoves } = await import('/js/chess.js');
+    for (let i = 0; i < 40 && !bookReady(); i++) await new Promise(r => setTimeout(r, 100));
+    // 1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6 5.Nc3 a6
+    const line = [[6,4,4,4],[1,2,3,2],[7,6,5,5],[1,3,2,3],[6,3,4,3],[3,2,4,3],[5,5,4,3],[0,6,2,5],[7,1,5,2],[1,0,2,0]];
+    let st = initState(), side = 'white';
+    for (const [fr, fc, tr, tc] of line) {
+      const mv = getLegalMoves(st, side).find(m => m.from[0] === fr && m.from[1] === fc && m.to[0] === tr && m.to[1] === tc);
+      st = makeMove(st, mv); side = side === 'white' ? 'black' : 'white';
+    }
+    return openingName(st, side);
+  });
+  check('opening names are known in the app', names === 'Sicilian Defence, Najdorf', names);
 
   await setThink(2);                       // keep the rest of the run quick
   await page.click('#new-game-btn'); await sleep(250);

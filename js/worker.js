@@ -17,6 +17,11 @@ import {
 import { makeMove } from './chess.js';
 import { loadModel, isReady as nnIsReady } from './neural.js';
 import { APP_VERSION } from './version.js';
+import { loadBook, bookMove } from './book.js';
+
+// The opening book is only needed by the network-only opponent; load it in
+// the background so it is ready by the time a game starts.
+loadBook();
 
 // Announce which build this is before anything else, so the page can refuse a
 // worker from a different release instead of waiting on it forever.
@@ -174,12 +179,20 @@ self.onmessage = (e) => {
   if (msg.type !== 'search') return;
 
   try {
-    const move = msg.opponent === 'network'
-      ? searchNetworkMove(msg.state, { history: msg.history })
-      : searchBestMove(msg.state, msg.timeLimit, msg.useNN && nnIsReady(), { history: msg.history });
+    let move = null, book = false;
+    if (msg.opponent === 'network') {
+      // Moves 1–9 come from the opening book while the game stays in it;
+      // after that, and whenever the player leaves the book, the network plays.
+      const side = msg.state._sideToMove || 'white';
+      move = bookMove(msg.state, side, msg.gamePly || 0);
+      book = !!move;
+      if (!move) move = searchNetworkMove(msg.state, { history: msg.history, plies: 2 * (msg.lookMoves || 3) });
+    } else {
+      move = searchBestMove(msg.state, msg.timeLimit, msg.useNN && nnIsReady(), { history: msg.history });
+    }
     self.postMessage({
       type: 'result', id: msg.id, move,
-      info: { depth: searchInfo.depth, score: searchInfo.score, nodes: searchInfo.nodes },
+      info: book ? { book: true } : { depth: searchInfo.depth, score: searchInfo.score, nodes: searchInfo.nodes },
     });
   } catch (err) {
     self.postMessage({

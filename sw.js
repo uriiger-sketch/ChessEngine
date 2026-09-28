@@ -14,7 +14,7 @@
 // All paths are relative to this worker's scope, so the app works the same at
 // a site root or in a subfolder (e.g. a GitHub Pages project site).
 
-const VERSION = '2.6.0';          // keep in step with js/version.js
+const VERSION = '2.7.0';          // keep in step with js/version.js
 const CACHE = 'chessnn-' + VERSION;
 
 const CODE = [
@@ -37,6 +37,7 @@ const MODEL = [
   'model/model.json',
   'model/weights.bin',
   'model/normalization.json',
+  'model/book.json',
 ];
 
 const abs = (p) => new URL(p, self.registration.scope).href;

@@ -160,6 +160,10 @@ body {
   color: var(--text);
 }
 
+/* One line: a long opening name is shortened with an ellipsis, never wrapped. */
+#status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#status .opening { font-size: 12px; font-weight: 500; color: #9a9a9a; }
+
 #status.check   { color: #f4a261; }
 #status.mate    { color: #e63946; }
 #status.draw    { color: #aaa; }

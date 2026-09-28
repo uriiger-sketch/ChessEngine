@@ -22,6 +22,8 @@ import {
 import { searchBestMove as searchNew, searchNetworkMove, resetEngine, zobristOf, setNNGain, setNNSplitEval } from '../js/engine.js';
 import { searchBestMove as searchOld } from './legacy-engine.js';
 import { loadModelFromDisk, nnReady, uiMoveToString } from './harness.js';
+import { setBook, bookMove } from '../js/book.js';
+import fsBook from 'fs';
 
 const arg = (name, dflt) => {
   const i = process.argv.indexOf('--' + name);
@@ -47,10 +49,16 @@ let playerA, playerB, nameA, nameB;
 if (MODE === 'network') {
   // The app's "Network only" opponent against the full engine.
   if (!nnLoaded) { console.error('network mode needs a loadable model.'); process.exit(2); }
+  // --net-plies N  the network looks N half-moves ahead
+  // --net-ms T     or deepens for T ms
+  // --book         the network opens from the opening book for moves 1–9
+  const NP = +arg('net-plies', 1), NT = +arg('net-ms', 0), BOOK = process.argv.includes('--book');
+  if (BOOK) setBook(JSON.parse(fsBook.readFileSync(new URL('../model/book.json', import.meta.url), 'utf8')));
   nameA = `full engine (${MS}ms)`;
-  nameB = 'network only';
+  nameB = (NT ? `network only (${NT}ms)` : `network only (${NP} ply)`) + (BOOK ? ' + book' : '');
   playerA = (st, side, hist) => searchNew(st, MS, true, { history: hist });
-  playerB = (st, side, hist) => searchNetworkMove(st, { history: hist });
+  playerB = (st, side, hist) => (BOOK && bookMove(st, side, hist.length / 2 - 1)) ||
+                                searchNetworkMove(st, { history: hist, plies: NP, timeMs: NT });
 } else if (MODE === 'nn') {
   if (!nnLoaded) { console.error('NN mode needs a loadable model.'); process.exit(2); }
   nameA = `new engine + NN (gain ${GAIN}${SPLIT ? ', split eval' : ''})`;
@@ -80,6 +88,10 @@ const rand = makeRand(+arg('seed', 20260922));
 
 // Random but legal opening, so the games are not all the same game.
 function randomOpening() {
+  // With the opening book in play, games start from the normal position: the
+  // book's own weighted choices supply the variety, and random first moves
+  // would only knock the book side out of its book.
+  if (MODE === 'network' && process.argv.includes('--book')) return initState();
   for (let attempt = 0; attempt < 50; attempt++) {
     let st = initState();
     let side = 'white';

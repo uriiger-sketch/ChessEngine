@@ -192,8 +192,15 @@ function networkEval(p) {
 }
 
 function evalLeaf(p, forPruning) {
-  if (networkOnly) return networkEval(p);
   const slot = p.keyLo & EV_MASK;
+  if (networkOnly) {
+    // Pruning decisions use the same network score: nothing hand-written
+    // enters a network-only search anywhere.
+    if (evOk[slot] && evKey[slot] === p.keyHi) return evVal[slot];
+    const v = networkEval(p);
+    evKey[slot] = p.keyHi; evVal[slot] = v; evOk[slot] = 1;
+    return v;
+  }
   if (!forPruning && evOk[slot] && evKey[slot] === p.keyHi) return evVal[slot];
 
   let v = handEvaluate(p);
@@ -507,7 +514,7 @@ function negamax(p, depth, alpha, beta, ply, isPV, canNull, prevMove) {
   // Store, preferring deeper entries but always replacing stale generations.
   // A root searched with moves excluded has a score for a restricted move list,
   // which is not the position's value, so it is kept out of the table.
-  const restricted = (ply === 0 && rootExclude !== null) || networkOnly;
+  const restricted = ply === 0 && rootExclude !== null;
   if (!aborted && !restricted && (ttFlag[slot] === 0 || ttAge[slot] !== ttGen || ttDepth[slot] <= depth)) {
     let s = bestScore;
     if (s > MATE_BOUND) s += ply;
@@ -627,6 +634,7 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
   const side = state._sideToMove || state.sideToMove || 'white';
   const uiMoves = getLegalMoves(state, side);
   if (uiMoves.length === 0) return null;
+  useTableFor('engine');
 
   beginSearch(timeLimit, useNN);
   loadRoot(state, side, opts);
@@ -647,26 +655,46 @@ export function searchBestMove(state, timeLimit, useNN, opts) {
   return matchUIMove(r.move, uiMoves) || uiMoves[0];
 }
 
+// The transposition table and evaluation cache hold scores from one kind of
+// evaluation only. Switching between the full engine and network-only play
+// (the player can change opponent mid-game) clears them, so a network score is
+// never mistaken for a full-engine one or the other way round.
+let tableMode = 'engine';
+function useTableFor(mode) {
+  if (tableMode !== mode) { ttClear(); evOk.fill(0); evCachedWithNN = null; tableMode = mode; }
+}
+
 /**
- * The trained network playing on its own: every legal move is scored by the
- * model's prediction for the position it leads to, and the best is played.
- * There is no look-ahead beyond that single move, apart from playing capture
- * sequences out to the end — without that it would leave pieces hanging to a
- * single capture, which says nothing about what the network learned. No
- * hand-written evaluation is involved.
+ * The trained network playing on its own. Every position is judged by the
+ * model's own prediction — material plus its learned correction — and nothing
+ * hand-written. What varies is how far ahead it looks:
+ *
+ *   opts.plies   look this many half-moves ahead (1 = just its own move);
+ *                capture sequences at the end are always played out, so a
+ *                piece is never simply left hanging
+ *   opts.timeMs  instead, deepen for this long, as far as time allows
+ *
+ * The search machinery (alpha-beta, move ordering, the table) is the same as
+ * the full engine's; the judgement at the end of each line is the network's.
  */
-export function searchNetworkMove(state, opts) {
+export function searchNetworkMove(state, opts = {}) {
   const side = state._sideToMove || state.sideToMove || 'white';
   const uiMoves = getLegalMoves(state, side);
   if (uiMoves.length === 0) return null;
   if (uiMoves.length === 1) return uiMoves[0];
 
-  beginSearch(5000, true);
+  const timed = opts.timeMs > 0;
+  const budget = timed ? opts.timeMs : 20000;           // a fixed depth finishes long before this
+  useTableFor('network');
+  beginSearch(budget, true);
+  contemptSide = 0; contemptCp = 0;
   loadRoot(state, side, opts);
   networkOnly = true;
+  evalCacheFor('network');
   try {
-    const r = iterate(pos, startTime + 5000, 1);
-    searchInfo.depth = 1;
+    const maxDepth = timed ? MAX_DEPTH : Math.max(1, Math.min(MAX_DEPTH, opts.plies || 1));
+    const r = iterate(pos, timed ? startTime + budget * 0.5 : startTime + budget, maxDepth);
+    searchInfo.depth = r.depth;
     return (r.move !== NO_MOVE && matchUIMove(r.move, uiMoves)) || uiMoves[0];
   } finally {
     networkOnly = false;

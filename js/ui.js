@@ -8,6 +8,7 @@ import {
 import { loadModel, isReady as nnIsReady, lastError as nnError } from './neural.js';
 import { searchBestMove, searchNetworkMove, createAnalysis, analyseStep, resetEngine, zobristOf, staticEvalOf } from './engine.js';
 import { APP_VERSION } from './version.js';
+import { loadBook, bookMove, openingName } from './book.js';
 
 // ── State ──────────────────────────────────────────────────────────────────
 let gameState     = null;
@@ -20,6 +21,11 @@ let thinkTimeMs   = 5000;   // set from the slider: 1–15 whole seconds
 // 'engine': the full engine. 'network': the trained network on its own,
 // choosing by its own prediction with no look-ahead (see searchNetworkMove).
 let opponent      = 'engine';
+// How far the network-only opponent looks ahead, in moves (its move and your
+// reply each). Measured: at 3 moves it starts winning games against the full
+// engine at 0.1s; at 1 move it never does.
+let lookMoves     = 3;
+let openingLabel  = '';     // last named opening reached in this game
 let gameOver      = false;
 let sideToMove    = 'white';
 let aiThinking    = false;
@@ -193,13 +199,16 @@ function findBestMove(state, timeLimit, historyKeys) {
       pendingSearches.set(id, resolve);
       worker.postMessage({
         type: 'search', id, state, timeLimit, useNN: withNN, history: historyKeys, opponent,
+        lookMoves, gamePly: history.length,
       });
     });
   }
   return new Promise(resolve => {
     setTimeout(() => {
+      const side = state._sideToMove || 'white';
       const move = opponent === 'network'
-        ? searchNetworkMove(state, { history: historyKeys })
+        ? (bookMove(state, side, history.length) ||
+           searchNetworkMove(state, { history: historyKeys, plies: 2 * lookMoves }))
         : searchBestMove(state, timeLimit, withNN, { history: historyKeys });
       resolve({ move, info: null });
     }, 20);
@@ -210,6 +219,9 @@ function resetSearchState() {
   if (worker) worker.postMessage({ type: 'reset' });
   else resetEngine();
 }
+
+// Opening names come from the book, loaded in the background.
+loadBook().then(() => { if (!aiThinking && !gameOver && gameState) updateStatus(); });
 
 // ── Neural Network Initialization ──────────────────────────────────────────
 // Pure-JS inference (js/neural.js) — no TensorFlow.js, no CDN, works offline.
@@ -429,6 +441,8 @@ function applyMove(mv, bySide) {
   sideToMove = opposite(bySide);
   selectedSq = null; selectedLegal = [];
   recordPosition();
+  const named = openingName(gameState, sideToMove);
+  if (named) openingLabel = named;
 
   // The player has committed to a move, so Back is available again.
   if (bySide === humanSide) {
@@ -474,6 +488,7 @@ function snapshot() {
     posCounts: new Map(posCounts),
     zobristKeys: zobristKeys.slice(),
     searchedEval,
+    openingLabel,
   };
 }
 
@@ -485,6 +500,7 @@ function restore(snap) {
   posCounts    = new Map(snap.posCounts);
   zobristKeys  = snap.zobristKeys.slice();
   searchedEval = snap.searchedEval;
+  openingLabel = snap.openingLabel || '';
   selectedSq   = null;
   selectedLegal = [];
   legalMoves   = getLegalMoves(gameState, sideToMove);
@@ -909,6 +925,14 @@ function updateStatus() {
 function setStatus(msg, cls = '') {
   statusEl.textContent = msg;
   statusEl.className = cls;
+  // The opening being played, when the game has reached a named book position
+  // (and it stays shown after the game leaves the book, as the game's opening).
+  if (openingLabel && cls !== 'mate' && cls !== 'draw') {
+    const span = document.createElement('span');
+    span.className = 'opening';
+    span.textContent = ' · ' + openingLabel;
+    statusEl.appendChild(span);
+  }
 }
 
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
@@ -1010,44 +1034,60 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter')  closeConfirm(true);
 });
 
-// ── Engine think time ──────────────────────────────────────────────────────
-// A slider for any whole number of seconds from 1 to 15. The choice is kept
-// between visits. It applies from the engine's next move.
+// ── Engine think time / network look-ahead ─────────────────────────────────
+// One slider, two meanings. Against the full engine it sets thinking time, any
+// whole number of seconds from 1 to 15. Against the network it sets how many
+// moves ahead the network looks, 1 to 5. Each value is kept between visits,
+// and applies from the opponent's next move.
 const thinkSlider = document.getElementById('think-slider');
 const thinkValue  = document.getElementById('think-value');
+const thinkLabel  = document.querySelector('#think-row label');
+
+function paintSlider(value, min, max, text, spoken) {
+  thinkSlider.min = String(min);
+  thinkSlider.max = String(max);
+  thinkSlider.value = String(value);
+  thinkValue.textContent = text;
+  thinkSlider.setAttribute('aria-valuetext', spoken);
+  // The filled part of the track, which WebKit cannot style on its own.
+  thinkSlider.style.setProperty('--fill', `${((value - min) / (max - min)) * 100}%`);
+}
 
 function setThinkSeconds(sec, save) {
   sec = Math.min(15, Math.max(1, Math.round(+sec) || 5));
   thinkTimeMs = sec * 1000;
-  thinkSlider.value = String(sec);
-  thinkValue.textContent = `${sec} s`;
-  thinkSlider.setAttribute('aria-valuetext', `${sec} second${sec === 1 ? '' : 's'}`);
-  // The filled part of the track, which WebKit cannot style on its own.
-  thinkSlider.style.setProperty('--fill', `${((sec - 1) / 14) * 100}%`);
+  if (opponent === 'engine') paintSlider(sec, 1, 15, `${sec} s`, `${sec} second${sec === 1 ? '' : 's'}`);
   if (save) { try { localStorage.setItem('chessnn.thinkSec', String(sec)); } catch (_) {} }
 }
 
-thinkSlider.addEventListener('input', () => setThinkSeconds(thinkSlider.value, true));
+function setLookMoves(n, save) {
+  n = Math.min(5, Math.max(1, Math.round(+n) || 3));
+  lookMoves = n;
+  if (opponent === 'network') paintSlider(n, 1, 5, `${n} move${n === 1 ? '' : 's'}`, `${n} move${n === 1 ? '' : 's'} ahead`);
+  if (save) { try { localStorage.setItem('chessnn.lookMoves', String(n)); } catch (_) {} }
+}
+
+thinkSlider.addEventListener('input', () => {
+  if (opponent === 'network') setLookMoves(thinkSlider.value, true);
+  else setThinkSeconds(thinkSlider.value, true);
+});
 {
-  let saved = null;
-  try { saved = localStorage.getItem('chessnn.thinkSec'); } catch (_) {}
-  setThinkSeconds(saved || thinkSlider.value, false);
+  let sec = null, look = null;
+  try { sec = localStorage.getItem('chessnn.thinkSec'); look = localStorage.getItem('chessnn.lookMoves'); } catch (_) {}
+  setThinkSeconds(sec || 5, false);
+  setLookMoves(look || 3, false);
 }
 
 // ── Opponent ───────────────────────────────────────────────────────────────
 // Can be changed at any point; it applies from the opponent's next move.
 const oppButtons = document.querySelectorAll('.opp-btn');
-const thinkRow   = document.getElementById('think-row');
 
 function setOpponent(o, save) {
   if (o !== 'engine' && o !== 'network') o = 'engine';
   opponent = o;
   oppButtons.forEach(b => b.setAttribute('aria-checked', String(b.dataset.opp === o)));
-  const net = o === 'network';
-  thinkRow.classList.toggle('off', net);
-  thinkSlider.disabled = net;
-  if (net) thinkValue.textContent = 'instant';
-  else setThinkSeconds(thinkTimeMs / 1000, false);
+  if (o === 'network') { thinkLabel.textContent = 'Network looks ahead'; setLookMoves(lookMoves, false); }
+  else { thinkLabel.textContent = 'Engine thinks'; setThinkSeconds(thinkTimeMs / 1000, false); }
   if (save) { try { localStorage.setItem('chessnn.opponent', o); } catch (_) {} }
 }
 
@@ -1149,6 +1189,7 @@ function startNewGame(chosenHumanSide = humanSide) {
   zobristKeys  = [];
   history      = [];
   backUsed     = false;
+  openingLabel = '';
   searchedEval = null;
   recordPosition();
   legalMoves   = getLegalMoves(gameState, 'white');
