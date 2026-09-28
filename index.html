@@ -45,11 +45,12 @@
 
     <div id="captured-wrap"></div>
 
-    <!-- Think time selector -->
-    <div class="btn-row">
-      <button class="ctrl-btn" data-time="2000">2s</button>
-      <button class="ctrl-btn active" data-time="5000">5s</button>
-      <button class="ctrl-btn" data-time="10000">10s</button>
+    <!-- Engine think time: any whole number of seconds from 1 to 15 -->
+    <div id="think-row">
+      <label for="think-slider">Engine thinks</label>
+      <input type="range" id="think-slider" min="1" max="15" step="1" value="5"
+             aria-valuetext="5 seconds">
+      <output id="think-value" for="think-slider">5 s</output>
     </div>
 
     <!-- Color selection -->
@@ -75,7 +76,7 @@
     <div id="mode-caption"></div>
 
     <div id="footer">
-      <div id="version">v2.4</div>
+      <div id="version">v2.5</div>
       <div id="credit">credit: igeru</div>
     </div>
   </div>

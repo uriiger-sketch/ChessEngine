@@ -43,9 +43,27 @@ loadModel().then(() => {
 //   stop     leave Help mode
 const STEP_MS      = 150;     // work between yields; bounds switching latency
 const MIN_SHOW     = 6;       // depths below this are noise, not worth showing
-const CAP_MS       = 60000;   // stop analysing one position after this long
+// On the player's turn the suggestions keep refining for this long, counted
+// from the moment the turn starts — not including any pondering before it,
+// which used to eat into the player's minute on exactly the turns where the
+// analysis had guessed the engine's reply right. The page may send its own.
+const TURN_MS      = 60000;
+const PONDER_MS    = 60000;   // pondering stops by itself after this long
 
-let job = null;               // { a, id, ponder, running }
+let job = null;               // { a, id, ponder, running, turnStart, budget }
+
+// Keep going? Pondering is bounded by its own work; the player's turn by the
+// wall clock since the turn began.
+function withinBudget(j) {
+  return j.ponder ? j.a.elapsed < PONDER_MS : Date.now() - j.turnStart < j.budget;
+}
+
+function beginTurn(j, msg) {
+  j.id = msg.id;
+  j.ponder = false;
+  j.turnStart = Date.now();
+  j.budget = msg.budgetMs > 0 ? msg.budgetMs : TURN_MS;
+}
 
 // Zero-delay yield. setTimeout(0) is clamped to 4ms after a few nestings,
 // which at 150ms steps would waste a few percent for nothing.
@@ -69,7 +87,7 @@ async function run(j) {
   if (j.running) return;
   j.running = true;
   try {
-    while (job === j && !j.a.done && j.a.elapsed < CAP_MS) {
+    while (job === j && !j.a.done && withinBudget(j)) {
       if (analyseStep(j.a, STEP_MS)) post(j, false);
       await yieldToEvents();
     }
@@ -93,14 +111,14 @@ function startAnalysis(msg) {
   // expected, so the analysis has been deepening this exact position all
   // through the engine's turn. Hand over what it has at once and carry on.
   if (job && analysisMatches(job.a, msg.state)) {
-    job.id = msg.id;
-    job.ponder = false;
+    beginTurn(job, msg);
     if (job.a.lines.length) post(job, job.a.done);
     run(job);
     return;
   }
   job = { a: createAnalysis(msg.state, msg.count, msg.useNN && nnIsReady(), msg.history),
-          id: msg.id, ponder: false, running: false };
+          running: false };
+  beginTurn(job, msg);
   run(job);
 }
 

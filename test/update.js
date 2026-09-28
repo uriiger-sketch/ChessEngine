@@ -102,7 +102,7 @@ async function helpWorks(p) {
   p = await ctx.newPage();
   await p.goto(url, { waitUntil: 'networkidle' }); await sleep(4000);
   await p.click('.mode-btn[data-mode="play"]');
-  await p.click('[data-time="2000"]');
+  await p.$eval('#think-slider', el => { el.value = '2'; el.dispatchEvent(new Event('input', { bubbles: true })); });
   const play = async () => {
     await p.evaluate(() => {
       for (const sq of document.querySelectorAll('#board .sq')) {

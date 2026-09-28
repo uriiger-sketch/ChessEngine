@@ -209,6 +209,61 @@ body {
 }
 #captured-wrap span { opacity: 0.75; }
 
+/* ── Engine think-time slider ── */
+#think-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 0 2px;
+}
+#think-row label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #aaa;
+  white-space: nowrap;
+}
+#think-value {
+  font-size: 14px;
+  font-weight: 700;
+  min-width: 34px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+#think-slider {
+  flex: 1;
+  min-width: 0;
+  height: 36px;                 /* the whole row height is the touch target */
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  /* The page disables browser touch gestures; the slider must keep its own. */
+  touch-action: pan-x;
+  cursor: pointer;
+  --fill: 28.6%;                /* set from script: how far along the value is */
+}
+#think-slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+#think-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(to right, var(--accent) var(--fill), #3a3a3a var(--fill));
+}
+#think-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 26px; height: 26px;
+  margin-top: -10px;            /* centre on the 6px track */
+  border-radius: 50%;
+  background: #f0f0f0;
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+}
+#think-slider::-moz-range-track { height: 6px; border-radius: 3px; background: #3a3a3a; }
+#think-slider::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
+#think-slider::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: #f0f0f0; border: 2px solid var(--accent);
+}
+
 /* Button rows */
 .btn-row {
   display: flex;

@@ -14,7 +14,7 @@
 // All paths are relative to this worker's scope, so the app works the same at
 // a site root or in a subfolder (e.g. a GitHub Pages project site).
 
-const VERSION = '2.4.0';          // keep in step with js/version.js
+const VERSION = '2.5.0';          // keep in step with js/version.js
 const CACHE = 'chessnn-' + VERSION;
 
 const CODE = [

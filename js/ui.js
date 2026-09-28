@@ -16,7 +16,7 @@ let aiSide        = 'black';
 let legalMoves    = [];
 let selectedSq    = null;
 let selectedLegal = [];
-let thinkTimeMs   = 5000;
+let thinkTimeMs   = 5000;   // set from the slider: 1–15 whole seconds
 let gameOver      = false;
 let sideToMove    = 'white';
 let aiThinking    = false;
@@ -46,7 +46,7 @@ const MODES = ['play', 'learn', 'help'];
 const MODE_CAPTIONS = {
   play:  'Just you and the engine.',
   learn: 'Back returns you to the start of your last turn.',
-  help:  'Your three best moves — they get stronger the longer you think.',
+  help:  'Your three best moves, refined for your first minute until you move.',
 };
 let mode          = loadMode();
 let backUsed      = false;
@@ -73,6 +73,11 @@ let hintWorkerOk   = null;
 // If no suggestion has arrived by then, the page analyses on its own thread.
 // Generous, because a worker's first load can be slow on a poor connection.
 const HINT_WATCHDOG_MS = 4000;
+// How long the suggestions keep refining on the player's turn, from the moment
+// the turn starts, unless they move sooner. The panel counts it down.
+const HINT_TURN_MS = 60000;
+let hintTurnStart  = 0;
+let hintTicker     = null;
 let hintsDrawn     = 0;       // how many of `hints` have arrows on the board
 
 // ── DOM References ─────────────────────────────────────────────────────────
@@ -542,13 +547,19 @@ function requestHints() {
   const id = ++hintReqId;
   hintsPending = true;
   hintsLive = true;
+  hintTurnStart = Date.now();
+  // Refresh the countdown once a second between depth updates.
+  hintTicker = setInterval(() => {
+    if (id !== hintReqId || !hintsLive) { clearInterval(hintTicker); hintTicker = null; return; }
+    renderHintNote();
+  }, 1000);
   renderHintPanel();
 
   const hw = getHintWorker();
   if (!hw) { startMainAnalysis(id); return; }
 
   hintSource = 'worker';
-  hw.postMessage(hintPayload('analyse', { id }));
+  hw.postMessage(hintPayload('analyse', { id, budgetMs: HINT_TURN_MS }));
   // Never wait silently: if the worker has said nothing useful in time, the
   // page does the analysis itself.
   hintWatchdog = setTimeout(() => {
@@ -580,7 +591,7 @@ function startMainAnalysis(id) {
       hintPanel.innerHTML = '<span class="hint-note">Suggestions unavailable — try New Game.</span>';
       return;
     }
-    if (!job.a.done && job.a.elapsed < 30000) setTimeout(step, 15);
+    if (!job.a.done && Date.now() - hintTurnStart < HINT_TURN_MS) setTimeout(step, 15);
     else receiveAnalysis({ id, lines: job.a.lines, depth: job.a.depth, done: true }, 'main');
   };
   setTimeout(step, 0);
@@ -633,6 +644,7 @@ function clearHintDisplay() {
 // what it has learned carries over, and the next request redirects it.
 function clearHints() {
   hintReqId++;
+  if (hintTicker) { clearInterval(hintTicker); hintTicker = null; }
   hintSource = null;
   mainJob = null;
   if (hintWatchdog) { clearTimeout(hintWatchdog); hintWatchdog = null; }
@@ -675,13 +687,27 @@ function renderHintPanel() {
     hintPanel.appendChild(chip);
   });
 
-  if (hintsPending || hints.length) {
-    const note = document.createElement('span');
+  renderHintNote();
+}
+
+// "depth 17 · refining · 42s", then "depth 24 · final" once the minute is up
+// (or sooner, if the analysis has nothing left to find, e.g. a forced mate).
+function renderHintNote() {
+  let note = hintPanel.querySelector('.hint-note');
+  if (!hintsPending && !hints.length) { note?.remove(); return; }
+  if (!note) {
+    note = document.createElement('span');
     note.className = 'hint-note';
-    if (hintsPending) note.innerHTML = 'Finding your best move<span class="dots"></span>';
-    else note.innerHTML = `depth ${hintDepth}` + (hintsLive ? '<span class="dots"></span>' : '');
-    note.title = 'How many moves ahead the analysis has looked. It keeps going while you think.';
+    note.title = 'How many moves ahead the analysis has looked. It keeps refining for your first minute.';
     hintPanel.appendChild(note);
+  }
+  if (hintsPending) {
+    note.innerHTML = 'Finding your best move<span class="dots"></span>';
+  } else if (hintsLive) {
+    const left = Math.max(0, Math.ceil((HINT_TURN_MS - (Date.now() - hintTurnStart)) / 1000));
+    note.textContent = `depth ${hintDepth} · refining · ${left}s`;
+  } else {
+    note.textContent = `depth ${hintDepth} · final`;
   }
 }
 
@@ -966,13 +992,29 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter')  closeConfirm(true);
 });
 
-document.querySelectorAll('[data-time]').forEach(btn => {
-  bindTap(btn, () => {
-    document.querySelectorAll('[data-time]').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    thinkTimeMs = parseInt(btn.dataset.time, 10);
-  });
-});
+// ── Engine think time ──────────────────────────────────────────────────────
+// A slider for any whole number of seconds from 1 to 15. The choice is kept
+// between visits. It applies from the engine's next move.
+const thinkSlider = document.getElementById('think-slider');
+const thinkValue  = document.getElementById('think-value');
+
+function setThinkSeconds(sec, save) {
+  sec = Math.min(15, Math.max(1, Math.round(+sec) || 5));
+  thinkTimeMs = sec * 1000;
+  thinkSlider.value = String(sec);
+  thinkValue.textContent = `${sec} s`;
+  thinkSlider.setAttribute('aria-valuetext', `${sec} second${sec === 1 ? '' : 's'}`);
+  // The filled part of the track, which WebKit cannot style on its own.
+  thinkSlider.style.setProperty('--fill', `${((sec - 1) / 14) * 100}%`);
+  if (save) { try { localStorage.setItem('chessnn.thinkSec', String(sec)); } catch (_) {} }
+}
+
+thinkSlider.addEventListener('input', () => setThinkSeconds(thinkSlider.value, true));
+{
+  let saved = null;
+  try { saved = localStorage.getItem('chessnn.thinkSec'); } catch (_) {}
+  setThinkSeconds(saved || thinkSlider.value, false);
+}
 
 // ── Mode switching ─────────────────────────────────────────────────────────
 function loadMode() {

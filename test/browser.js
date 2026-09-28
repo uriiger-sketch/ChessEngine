@@ -73,7 +73,9 @@ function check(name, ok, detail) {
   // The network is always on — there is no switch for it any more.
   check('no neural-net toggle', (await page.$('#nn-cb')) === null);
 
-  await page.click('[data-time="2000"]');
+  const setThink = sec => page.$eval('#think-slider', (el, v) => {
+    el.value = v; el.dispatchEvent(new Event('input', { bubbles: true }));
+  }, String(sec));
 
   const status = () => page.textContent('#status');
   const waitForAI = async () => {
@@ -131,6 +133,28 @@ function check(name, ok, detail) {
     const m = (document.querySelector('#hint-panel .hint-note')?.textContent || '').match(/depth (\d+)/);
     return m ? +m[1] : 0;
   });
+
+  // ── Engine think time: a 1–15 second slider ─────────────────────────────
+  const sl = await page.$eval('#think-slider', el => ({ min: el.min, max: el.max, step: el.step, type: el.type }));
+  check('think time is a 1–15 s slider in whole seconds',
+        sl.type === 'range' && sl.min === '1' && sl.max === '15' && sl.step === '1', JSON.stringify(sl));
+  await setThink(11);
+  check('slider shows its value', (await page.textContent('#think-value')).trim() === '11 s',
+        await page.textContent('#think-value'));
+  await setThink(1);
+  let t0 = Date.now();
+  await playHuman(); await sleep(100); await waitForAI();
+  const at1 = Date.now() - t0;
+  check('engine answers within ~1 s at the 1 s setting', at1 < 2200, `${at1}ms`);
+  await setThink(4);
+  t0 = Date.now();
+  await playHuman(); await sleep(100); await waitForAI();
+  const at4 = Date.now() - t0;
+  check('engine takes longer at the 4 s setting', at4 > 1500 && at4 < 5500, `${at4}ms`);
+  await setThink(2);                       // keep the rest of the run quick
+  await page.click('#new-game-btn'); await sleep(250);
+  if (!(await page.isHidden('#confirm-modal'))) await page.click('#confirm-yes');
+  await sleep(400);
 
   // ── Play mode by default ────────────────────────────────────────────────
   check('starts in Play mode', (await mode()) === 'play', await mode());
@@ -236,6 +260,7 @@ function check(name, ok, detail) {
   await page.reload({ waitUntil: 'networkidle' });
   await sleep(1500);
   check('mode remembered across reload', (await mode()) === 'help', await mode());
+  check('think time remembered across reload', (await page.$eval('#think-slider', el => el.value)) === '2');
   check('hints shown after reload', await waitForHints());
 
   // ── Board integrity ─────────────────────────────────────────────────────
@@ -270,6 +295,23 @@ function check(name, ok, detail) {
   const blackStatus = await waitForAI();
   check('engine opens when player is Black', blackStatus.includes('Black to move'), blackStatus);
   check('hints for Black after the engine opens', await waitForHints());
+
+  // ── Suggestions refine for the player's first minute, then stop ─────────
+  const noteText = () => page.evaluate(() => document.querySelector('#hint-panel .hint-note')?.textContent || '');
+  await sleep(3000);
+  const early = await noteText();
+  const left = +((early.match(/refining · (\d+)s/) || [])[1] || 0);
+  check('panel says it is still refining, with time left', left > 40 && left <= 60, early);
+  const dEarly = await hintDepth();
+  console.log(`  waiting out the minute (${left}s)...`);
+  await sleep((left + 3) * 1000);
+  const late = await noteText();
+  const dLate = await hintDepth();
+  check('it went on refining through the minute', dLate > dEarly, `depth ${dEarly} → ${dLate}`);
+  check('after the minute the suggestions are final', /final/.test(late), late);
+  await sleep(2500);
+  check('and it stops working', (await hintDepth()) === dLate, `depth ${dLate} → ${await hintDepth()}`);
+  check('three suggestions still shown', (await chips()).length === 3);
 
   // ── Help mode must never hang ───────────────────────────────────────────
   // v2.3 on a phone whose cache mixed two releases: the worker ignored every
